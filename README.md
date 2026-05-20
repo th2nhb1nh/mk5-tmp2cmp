@@ -489,6 +489,22 @@ You picked a non-text field by mistake. The stamping target needs to be a single
 
 The script already retries with exponential backoff. If sustained, increase `SLEEP_BETWEEN_WRITES` at the top of the script.
 
+### `POST /rest/api/3/search/jql -> 400: Invalid request payload`
+
+The new search endpoint validates the body strictly. Common payload mistakes:
+
+- `expand` sent as a JSON array. Must be a **comma-separated string**: `"names,schema"`, not `["names","schema"]`. The script handles this for you and will coerce lists to strings, but if you're hitting this from a custom call, check that.
+- `startAt` sent. The new endpoint rejects it — pagination is `nextPageToken`-based. The script never sends `startAt`.
+- `nextPageToken: null` on the first request. Atlassian's docs say the first page has token `null`, but actually passing `null` errors with "The provided next page token is invalid or expired." The script omits the field entirely on the first request.
+
+Since v1.1 the error log includes the full request body so you can see exactly what was sent:
+
+```
+ERROR POST .../search/jql -> 400 body={"jql":"project = \"MK5\"","fields":["*all"],"maxResults":100,"fieldsByKeys":false,"expand":"names"}: {"errorMessages":["Invalid request payload..."]}
+```
+
+If your payload looks right and the call still 400s, the JQL itself may be unbounded or reference an inaccessible field — try the same JQL in the UI's issue navigator first.
+
 ### A redirected URL appears in error logs
 
 E.g. log shows `/rest/api/2/project/X` even though the script uses `/rest/api/3/`. Atlassian transparently redirects v3 to v2 for some endpoints. The script logs the original v3 URL it requested plus the redirect target so you can see what's happening. The behavior is correct — the 404 (or whatever code) applies to the redirected URL just as it would to the original.
