@@ -3,22 +3,15 @@
 Jira TMP -> CMP Migration Toolkit (Phase 3: extract & rebuild)
 
 Subcommands:
-  extract     Pull source TMP project config + inventory to local artifacts.
+  extract     Single-pass scan of source TMP. Writes all artifacts.
   stamp-keys  Write each source issue's current key into a designated text
-              custom field (e.g. customfield_25199). Survives bulk move.
-  build       Recreate versions, components, and sprints in the target CMP
-              from extracted artifacts. Outputs ID mapping CSVs.
+              custom field. Survives bulk-move.
+  build       Recreate versions, components, sprints in target CMP from
+              extract artifacts. Outputs ID mapping CSVs.
   validate    Compare source baseline counts against target post-move counts.
 
 Auth: Atlassian Cloud API token + email (HTTP Basic).
-
-Assumptions:
-  - Source is a Jira Software TMP (has a board + sprints).
-  - Target CMP shell already exists (created via UI to allow scheme assignment),
-    OR pass --create-target to have this script create a minimal shell.
-  - Target customfield used for key preservation is a single-line text field
-    that has been added to all relevant screens of the SOURCE project before
-    running stamp-keys.
+Config: read directly from .env on every run (no `source` required).
 
 Re-runnable. Each phase writes a checkpoint; re-running skips work already done.
 """
@@ -33,10 +26,9 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -44,18 +36,60 @@ from urllib3.util.retry import Retry
 
 
 # ---------------------------------------------------------------------------
-# Config & logging
+# .env loader (no dependency on python-dotenv)
+# ---------------------------------------------------------------------------
+
+def load_dotenv(explicit_path: Optional[str] = None) -> Optional[Path]:
+    """Load KEY=value pairs from .env into os.environ, overriding existing
+    values so edits to .env take effect without re-sourcing the shell.
+
+    Search order:
+      1. --env-file CLI arg if provided
+      2. ./.env in current working directory
+      3. .env next to this script
+    Returns the path that was loaded, or None.
+    """
+    candidates: List[Path] = []
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+    candidates.append(Path.cwd() / ".env")
+    candidates.append(Path(__file__).resolve().parent / ".env")
+
+    for path in candidates:
+        if not path.exists():
+            continue
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            # Strip matched surrounding quotes
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            os.environ[key] = value
+        return path
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Constants & logging
 # ---------------------------------------------------------------------------
 
 DEFAULT_TIMEOUT = 30
 PAGE_SIZE_SEARCH = 100
 PAGE_SIZE_GENERIC = 50
-SLEEP_BETWEEN_WRITES = 0.10  # gentle rate limiting on writes
+SLEEP_BETWEEN_WRITES = 0.10
 
 
 def setup_logging(output_dir: Path, verbose: bool) -> None:
-    log_path = output_dir / "migration.log"
     output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "migration.log"
     fmt = "%(asctime)s %(levelname)-7s %(message)s"
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -67,6 +101,10 @@ def setup_logging(output_dir: Path, verbose: bool) -> None:
         ],
     )
 
+
+# ---------------------------------------------------------------------------
+# Config (env-first; CLI overrides)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Config:
@@ -85,30 +123,54 @@ class Config:
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "Config":
-        base = os.environ.get("JIRA_BASE_URL", args.base_url or "").rstrip("/")
-        email = os.environ.get("JIRA_EMAIL", args.email or "")
+        def pick(cli_val, env_key: str, default: str = "") -> str:
+            if cli_val:
+                return str(cli_val)
+            return os.environ.get(env_key, default)
+
+        base_url = pick(getattr(args, "base_url", None), "JIRA_BASE_URL").rstrip("/")
+        email = pick(getattr(args, "email", None), "JIRA_EMAIL")
         token = os.environ.get("JIRA_API_TOKEN", "")
-        if not (base and email and token):
+
+        missing = [
+            name for name, val in [
+                ("JIRA_BASE_URL", base_url),
+                ("JIRA_EMAIL", email),
+                ("JIRA_API_TOKEN", token),
+            ] if not val
+        ]
+        if missing:
             raise SystemExit(
-                "Missing credentials. Set JIRA_BASE_URL, JIRA_EMAIL, "
-                "JIRA_API_TOKEN env vars (see .env.example)."
+                "Missing credentials in .env (or env): " + ", ".join(missing)
+                + "\nSee .env.example for the required keys."
             )
+
+        target_board_env = os.environ.get("JIRA_TARGET_BOARD_ID")
+        target_board = getattr(args, "target_board_id", None)
+        if target_board is None and target_board_env:
+            try:
+                target_board = int(target_board_env)
+            except ValueError:
+                raise SystemExit(f"JIRA_TARGET_BOARD_ID must be an integer, got '{target_board_env}'")
+
         return cls(
-            base_url=base,
+            base_url=base_url,
             email=email,
             api_token=token,
-            source_key=getattr(args, "source_key", "") or "",
-            target_key=getattr(args, "target_key", "") or "",
-            key_field_id=getattr(args, "key_field", "customfield_25199"),
-            output_dir=Path(getattr(args, "output_dir", "./out")).resolve(),
+            source_key=pick(getattr(args, "source_key", None), "JIRA_SOURCE_KEY"),
+            target_key=pick(getattr(args, "target_key", None), "JIRA_TARGET_KEY"),
+            key_field_id=pick(getattr(args, "key_field", None), "JIRA_KEY_FIELD",
+                              "customfield_25199"),
+            output_dir=Path(pick(getattr(args, "output_dir", None), "JIRA_OUTPUT_DIR",
+                                  "./out")).resolve(),
             dry_run=getattr(args, "dry_run", False),
             create_target=getattr(args, "create_target", False),
-            target_board_id=getattr(args, "target_board_id", None),
-            target_project_lead_account_id=getattr(args, "target_lead", None),
-            target_template=getattr(
-                args, "target_template",
-                "com.pyxis.greenhopper.jira:gh-simplified-scrum-classic",
-            ),
+            target_board_id=target_board,
+            target_project_lead_account_id=pick(
+                getattr(args, "target_lead", None), "JIRA_TARGET_LEAD"),
+            target_template=pick(
+                getattr(args, "target_template", None), "JIRA_TARGET_TEMPLATE",
+                "com.pyxis.greenhopper.jira:gh-simplified-scrum-classic"),
         )
 
 
@@ -131,8 +193,7 @@ class JiraClient:
             "Content-Type": "application/json",
         })
         retry = Retry(
-            total=6,
-            backoff_factor=1.5,
+            total=6, backoff_factor=1.5,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET", "POST", "PUT", "DELETE"],
             respect_retry_after_header=True,
@@ -140,38 +201,38 @@ class JiraClient:
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
         self.session.mount("http://", HTTPAdapter(max_retries=retry))
 
-    def _req(self, method: str, path: str, **kwargs) -> requests.Response:
+    def _req(self, method: str, path: str,
+             expected_404: bool = False, **kwargs) -> requests.Response:
         url = path if path.startswith("http") else f"{self.base_url}{path}"
         kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
         resp = self.session.request(method, url, **kwargs)
         if resp.status_code >= 400:
-            logging.error("%s %s -> %s: %s", method, url, resp.status_code, resp.text[:500])
+            # 404 callers handle locally; downgrade to DEBUG to avoid alarm
+            level = logging.DEBUG if (resp.status_code == 404 and expected_404) \
+                else (logging.WARNING if resp.status_code < 500 else logging.ERROR)
+            logging.log(level, "%s %s -> %s: %s",
+                        method, url, resp.status_code, resp.text[:500])
             resp.raise_for_status()
         return resp
 
-    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        r = self._req("GET", path, params=params)
-        if not r.content:
-            return None
-        return r.json()
+    def get(self, path: str, params: Optional[Dict[str, Any]] = None,
+            expected_404: bool = False) -> Any:
+        r = self._req("GET", path, params=params, expected_404=expected_404)
+        return r.json() if r.content else None
 
     def post(self, path: str, body: Optional[Dict[str, Any]] = None,
              params: Optional[Dict[str, Any]] = None) -> Any:
         r = self._req("POST", path, json=body or {}, params=params)
-        if not r.content:
-            return None
-        return r.json()
+        return r.json() if r.content else None
 
     def put(self, path: str, body: Optional[Dict[str, Any]] = None,
             params: Optional[Dict[str, Any]] = None) -> Any:
         r = self._req("PUT", path, json=body or {}, params=params)
-        if not r.content:
-            return None
-        return r.json()
+        return r.json() if r.content else None
 
     def paged(self, path: str, params: Optional[Dict[str, Any]] = None,
-              values_key: str = "values", page_size: int = PAGE_SIZE_GENERIC) -> Iterable[Dict[str, Any]]:
-        """Generic offset-based pagination (Agile API, fields, etc.)."""
+              values_key: str = "values",
+              page_size: int = PAGE_SIZE_GENERIC) -> Iterable[Dict[str, Any]]:
         params = dict(params or {})
         params.setdefault("maxResults", page_size)
         start = 0
@@ -180,33 +241,30 @@ class JiraClient:
             payload = self.get(path, params=params)
             if not payload:
                 break
-            items = payload.get(values_key, payload if isinstance(payload, list) else [])
+            items = payload.get(values_key,
+                                payload if isinstance(payload, list) else [])
+            if not items:
+                break
             for item in items:
                 yield item
-            is_last = payload.get("isLast")
+            if payload.get("isLast") is True:
+                break
             total = payload.get("total")
-            got = len(items)
-            if got == 0:
-                break
-            start += got
-            if is_last is True:
-                break
+            start += len(items)
             if total is not None and start >= total:
                 break
 
     def search_jql(self, jql: str, fields: List[str],
                    expand: Optional[List[str]] = None) -> Iterable[Dict[str, Any]]:
-        """Paginate via the modern /search/jql endpoint (token-based)."""
+        """Modern /search/jql endpoint with token-based pagination."""
         token: Optional[str] = None
-        body_base: Dict[str, Any] = {
-            "jql": jql,
-            "fields": fields,
-            "maxResults": PAGE_SIZE_SEARCH,
+        base_body: Dict[str, Any] = {
+            "jql": jql, "fields": fields, "maxResults": PAGE_SIZE_SEARCH,
         }
         if expand:
-            body_base["expand"] = expand
+            base_body["expand"] = expand
         while True:
-            body = dict(body_base)
+            body = dict(base_body)
             if token:
                 body["nextPageToken"] = token
             payload = self.post("/rest/api/3/search/jql", body=body)
@@ -217,12 +275,59 @@ class JiraClient:
             token = payload["nextPageToken"]
 
     def approximate_count(self, jql: str) -> int:
-        payload = self.post("/rest/api/3/search/approximate-count", body={"jql": jql})
+        payload = self.post("/rest/api/3/search/approximate-count",
+                            body={"jql": jql})
         return int(payload.get("count", 0))
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Auth verification (every command runs this first)
+# ---------------------------------------------------------------------------
+
+def verify_auth(client: JiraClient) -> Dict[str, Any]:
+    """Hit /myself before doing anything else. Fail fast on auth issues."""
+    try:
+        me = client.get("/rest/api/3/myself")
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        if code in (401, 403):
+            raise SystemExit(
+                f"Authentication failed ({code}). Check JIRA_EMAIL and "
+                f"JIRA_API_TOKEN in .env. Token generated at "
+                f"https://id.atlassian.com/manage-profile/security/api-tokens"
+            )
+        raise SystemExit(f"Auth precheck failed with HTTP {code}: {e}")
+    except requests.RequestException as e:
+        raise SystemExit(
+            f"Cannot reach {client.base_url}. Check JIRA_BASE_URL and network. ({e})"
+        )
+
+    logging.info("Authenticated as %s <%s>",
+                 me.get("displayName"), me.get("emailAddress"))
+    logging.debug("accountId=%s", me.get("accountId"))
+    return me
+
+
+def verify_project_exists(client: JiraClient, key: str, label: str) -> Dict[str, Any]:
+    """Confirm a project key resolves. Friendly error if not."""
+    proj = client.get(f"/rest/api/3/project/{key}", expected_404=True) \
+        if False else None
+    try:
+        proj = client.get(f"/rest/api/3/project/{key}", expected_404=True)
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            raise SystemExit(
+                f"{label} project '{key}' not found on {client.base_url}. "
+                f"Check the key in .env."
+            )
+        raise
+    logging.info("%s project: %s (id=%s, style=%s)",
+                 label, proj["key"], proj["id"], proj.get("style", "?"))
+    return proj
+
+
+# ---------------------------------------------------------------------------
+# File helpers
 # ---------------------------------------------------------------------------
 
 def write_json(path: Path, data: Any) -> None:
@@ -231,7 +336,8 @@ def write_json(path: Path, data: Any) -> None:
     logging.info("Wrote %s", path)
 
 
-def write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
+def write_csv(path: Path, rows: List[Dict[str, Any]],
+              fieldnames: List[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -254,18 +360,125 @@ def confirm(prompt: str, dry_run: bool) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# EXTRACT phase
+# EXTRACT phase - single pass over source issues
 # ---------------------------------------------------------------------------
+
+def scan_source(client: JiraClient, source_key: str) -> Dict[str, Any]:
+    """One iteration of source issues; builds issue types, statuses,
+    custom fields, and inventory buckets together."""
+    logging.info("Scanning source issues (this is the single pass)...")
+
+    field_catalog = {f["id"]: f for f in (client.get("/rest/api/3/field") or [])}
+    sprint_field_ids = {
+        fid for fid, f in field_catalog.items()
+        if (f.get("schema") or {}).get("custom", "").endswith(":gh-sprint")
+    }
+
+    issue_types: Dict[str, Dict[str, Any]] = {}
+    statuses: Dict[str, Dict[str, Any]] = {}
+    custom_fields: Dict[str, Dict[str, Any]] = {}
+    by_type: Dict[str, int] = {}
+    by_status: Dict[str, int] = {}
+    by_resolution: Dict[str, int] = {}
+    counters = {
+        "total": 0,
+        "withAttachments": 0,
+        "withComments": 0,
+        "withFixVersion": 0,
+        "withComponents": 0,
+        "withSprint": 0,
+    }
+
+    jql = f'project = "{source_key}"'
+    for issue in client.search_jql(jql, fields=["*all"], expand=["names"]):
+        counters["total"] += 1
+        f = issue["fields"]
+        names = issue.get("names", {}) or {}
+
+        # Issue type
+        it = f.get("issuetype") or {}
+        if it.get("id") and it["id"] not in issue_types:
+            issue_types[it["id"]] = {
+                "id": it["id"], "name": it.get("name"),
+                "subtask": it.get("subtask", False),
+                "hierarchyLevel": it.get("hierarchyLevel"),
+            }
+        by_type[it.get("name", "?")] = by_type.get(it.get("name", "?"), 0) + 1
+
+        # Status (per issue type)
+        st = f.get("status") or {}
+        st_key = f"{it.get('name')}::{st.get('name')}"
+        if st.get("id") and st_key not in statuses:
+            statuses[st_key] = {
+                "issueType": it.get("name"),
+                "statusName": st.get("name"),
+                "statusId": st.get("id"),
+                "statusCategory": (st.get("statusCategory") or {}).get("key"),
+            }
+        by_status[st.get("name", "?")] = by_status.get(st.get("name", "?"), 0) + 1
+
+        # Resolution
+        res = f.get("resolution")
+        res_name = res["name"] if isinstance(res, dict) else "<unresolved>"
+        by_resolution[res_name] = by_resolution.get(res_name, 0) + 1
+
+        # Inventory flags
+        if f.get("attachment"):
+            counters["withAttachments"] += 1
+        comment_obj = f.get("comment")
+        if isinstance(comment_obj, dict) and comment_obj.get("comments"):
+            counters["withComments"] += 1
+        if f.get("fixVersions"):
+            counters["withFixVersion"] += 1
+        if f.get("components"):
+            counters["withComponents"] += 1
+        if any(f.get(fid) for fid in sprint_field_ids):
+            counters["withSprint"] += 1
+
+        # Custom fields with non-empty values
+        for fid, val in f.items():
+            if not fid.startswith("customfield_"):
+                continue
+            if val in (None, "", [], {}):
+                continue
+            if fid in custom_fields:
+                continue
+            cat = field_catalog.get(fid, {})
+            schema = cat.get("schema") or {}
+            custom_fields[fid] = {
+                "fieldId": fid,
+                "displayName": names.get(fid) or cat.get("name", ""),
+                "schemaType": schema.get("type", ""),
+                "schemaCustom": schema.get("custom", ""),
+                "exampleValue": str(val)[:200],
+            }
+
+        if counters["total"] % 200 == 0:
+            logging.info("...scanned %d issues", counters["total"])
+
+    logging.info("Scan complete: %d issues, %d distinct issue types, "
+                 "%d distinct status pairs, %d custom fields in use",
+                 counters["total"], len(issue_types), len(statuses),
+                 len(custom_fields))
+
+    return {
+        "issue_types": list(issue_types.values()),
+        "statuses": list(statuses.values()),
+        "custom_fields": list(custom_fields.values()),
+        "by_type": by_type,
+        "by_status": by_status,
+        "by_resolution": by_resolution,
+        "counters": counters,
+    }
+
 
 def extract_project_meta(client: JiraClient, key: str) -> Dict[str, Any]:
     meta = client.get(f"/rest/api/3/project/{key}",
-                      params={"expand": "description,lead,projectKeys,issueTypes"})
+                      params={"expand": "description,lead,issueTypes"})
     return {
-        "id": meta["id"],
-        "key": meta["key"],
-        "name": meta["name"],
+        "id": meta["id"], "key": meta["key"], "name": meta["name"],
         "projectTypeKey": meta.get("projectTypeKey"),
-        "style": meta.get("style"),  # 'next-gen' = TMP, 'classic' = CMP
+        "style": meta.get("style"),
         "description": meta.get("description"),
         "lead": (meta.get("lead") or {}).get("accountId"),
         "leadDisplayName": (meta.get("lead") or {}).get("displayName"),
@@ -275,223 +488,89 @@ def extract_project_meta(client: JiraClient, key: str) -> Dict[str, Any]:
     }
 
 
-def extract_issue_types_in_use(client: JiraClient, key: str) -> List[Dict[str, Any]]:
-    jql = f'project = "{key}"'
-    seen: Dict[str, Dict[str, Any]] = {}
-    for issue in client.search_jql(jql, fields=["issuetype"]):
-        it = issue["fields"]["issuetype"]
-        if it["id"] not in seen:
-            seen[it["id"]] = {
-                "id": it["id"],
-                "name": it["name"],
-                "subtask": it.get("subtask", False),
-                "hierarchyLevel": it.get("hierarchyLevel"),
-            }
-    return list(seen.values())
-
-
-def extract_statuses_in_use(client: JiraClient, key: str) -> List[Dict[str, Any]]:
-    jql = f'project = "{key}"'
-    seen: Dict[str, Dict[str, Any]] = {}
-    for issue in client.search_jql(jql, fields=["status", "issuetype"]):
-        st = issue["fields"]["status"]
-        it = issue["fields"]["issuetype"]
-        key_tuple = f"{it['name']}::{st['name']}"
-        if key_tuple not in seen:
-            seen[key_tuple] = {
-                "issueType": it["name"],
-                "statusName": st["name"],
-                "statusId": st["id"],
-                "statusCategory": (st.get("statusCategory") or {}).get("key"),
-            }
-    return list(seen.values())
-
-
 def extract_versions(client: JiraClient, key: str) -> List[Dict[str, Any]]:
     versions = client.get(f"/rest/api/3/project/{key}/versions") or []
-    out = []
-    for i, v in enumerate(versions):
-        out.append({
-            "sequence": i,
-            "id": v["id"],
-            "name": v["name"],
-            "description": v.get("description", ""),
-            "startDate": v.get("startDate", ""),
-            "releaseDate": v.get("releaseDate", ""),
-            "released": v.get("released", False),
-            "archived": v.get("archived", False),
-            "overdue": v.get("overdue", False),
-        })
-    return out
+    return [{
+        "sequence": i, "id": v["id"], "name": v["name"],
+        "description": v.get("description", ""),
+        "startDate": v.get("startDate", ""),
+        "releaseDate": v.get("releaseDate", ""),
+        "released": v.get("released", False),
+        "archived": v.get("archived", False),
+    } for i, v in enumerate(versions)]
 
 
 def extract_components(client: JiraClient, key: str) -> List[Dict[str, Any]]:
     comps = client.get(f"/rest/api/3/project/{key}/components") or []
-    out = []
-    for c in comps:
-        out.append({
-            "id": c["id"],
-            "name": c["name"],
-            "description": c.get("description", ""),
-            "leadAccountId": (c.get("lead") or {}).get("accountId", ""),
-            "assigneeType": c.get("assigneeType", "PROJECT_DEFAULT"),
-            "realAssigneeType": c.get("realAssigneeType", ""),
-        })
-    return out
+    return [{
+        "id": c["id"], "name": c["name"],
+        "description": c.get("description", ""),
+        "leadAccountId": (c.get("lead") or {}).get("accountId", ""),
+        "assigneeType": c.get("assigneeType", "PROJECT_DEFAULT"),
+        "realAssigneeType": c.get("realAssigneeType", ""),
+    } for c in comps]
 
 
 def find_source_board(client: JiraClient, key: str) -> Optional[Dict[str, Any]]:
     boards = list(client.paged("/rest/agile/1.0/board",
-                               params={"projectKeyOrId": key}, page_size=50))
+                                params={"projectKeyOrId": key}, page_size=50))
     if not boards:
         return None
-    # Prefer scrum board for sprint data
     scrum = [b for b in boards if b.get("type") == "scrum"]
     return (scrum or boards)[0]
 
 
 def extract_sprints(client: JiraClient, board_id: int) -> List[Dict[str, Any]]:
     sprints = list(client.paged(f"/rest/agile/1.0/board/{board_id}/sprint",
-                                params={"state": "closed,active,future"}, page_size=50))
-    out = []
-    # Sort: closed by completeDate asc, then active, then future
+                                params={"state": "closed,active,future"},
+                                page_size=50))
+    state_order = {"closed": 0, "active": 1, "future": 2}
+
     def sort_key(s):
-        state_order = {"closed": 0, "active": 1, "future": 2}
         return (state_order.get(s.get("state", "future"), 3),
                 s.get("completeDate") or s.get("startDate") or "")
-    for s in sorted(sprints, key=sort_key):
-        out.append({
-            "id": s["id"],
-            "name": s["name"],
-            "state": s["state"],
-            "startDate": s.get("startDate", ""),
-            "endDate": s.get("endDate", ""),
-            "completeDate": s.get("completeDate", ""),
-            "goal": s.get("goal", ""),
-            "originBoardId": s.get("originBoardId"),
-        })
-    return out
 
-
-def extract_board_config(client: JiraClient, board_id: int) -> Dict[str, Any]:
-    return client.get(f"/rest/agile/1.0/board/{board_id}/configuration")
+    return [{
+        "id": s["id"], "name": s["name"], "state": s["state"],
+        "startDate": s.get("startDate", ""),
+        "endDate": s.get("endDate", ""),
+        "completeDate": s.get("completeDate", ""),
+        "goal": s.get("goal", ""),
+        "originBoardId": s.get("originBoardId"),
+    } for s in sorted(sprints, key=sort_key)]
 
 
 def extract_roles(client: JiraClient, key: str) -> Dict[str, Any]:
     role_map = client.get(f"/rest/api/3/project/{key}/role") or {}
     out: Dict[str, Any] = {}
     for role_name, role_url in role_map.items():
-        role_detail = client.get(role_url)
+        detail = client.get(role_url)
         out[role_name] = {
-            "id": role_detail.get("id"),
-            "actors": [
-                {
-                    "displayName": a.get("displayName"),
-                    "type": a.get("type"),
-                    "accountId": (a.get("actorUser") or {}).get("accountId"),
-                    "groupName": (a.get("actorGroup") or {}).get("name"),
-                }
-                for a in role_detail.get("actors", [])
-            ],
+            "id": detail.get("id"),
+            "actors": [{
+                "displayName": a.get("displayName"),
+                "type": a.get("type"),
+                "accountId": (a.get("actorUser") or {}).get("accountId"),
+                "groupName": (a.get("actorGroup") or {}).get("name"),
+            } for a in detail.get("actors", [])],
         }
-    return out
-
-
-def extract_custom_fields_in_use(client: JiraClient, key: str) -> List[Dict[str, Any]]:
-    """Sample fields actually present on source issues. TMP-scoped fields
-    typically appear with names but underlying IDs may be project-scoped."""
-    jql = f'project = "{key}"'
-    seen_fields: Dict[str, Dict[str, Any]] = {}
-    field_catalog = {f["id"]: f for f in (client.get("/rest/api/3/field") or [])}
-
-    sample_count = 0
-    for issue in client.search_jql(jql, fields=["*all"], expand=["names"]):
-        sample_count += 1
-        names = issue.get("names", {}) or {}
-        for fid, value in issue["fields"].items():
-            if value in (None, "", [], {}):
-                continue
-            if fid in seen_fields:
-                continue
-            cat = field_catalog.get(fid, {})
-            if cat.get("custom") is False:
-                continue  # skip system fields
-            if not fid.startswith("customfield_"):
-                continue
-            seen_fields[fid] = {
-                "fieldId": fid,
-                "displayName": names.get(fid) or cat.get("name", ""),
-                "schemaType": (cat.get("schema") or {}).get("type", ""),
-                "schemaCustom": (cat.get("schema") or {}).get("custom", ""),
-                "exampleValue": str(value)[:200],
-            }
-        if sample_count >= 500:
-            # 500-issue sample is plenty to identify all TMP fields in use
-            break
-    return list(seen_fields.values())
-
-
-def extract_inventory_counts(client: JiraClient, key: str) -> Dict[str, Any]:
-    total = client.approximate_count(f'project = "{key}"')
-
-    def bucket(jql: str) -> int:
-        return client.approximate_count(jql)
-
-    return {
-        "total": total,
-        "byType": _bucketed(client, key, "issuetype"),
-        "byStatus": _bucketed(client, key, "status"),
-        "byResolution": _bucketed(client, key, "resolution"),
-        "withAttachments": bucket(f'project = "{key}" AND attachments is not EMPTY'),
-        "withComments": bucket(f'project = "{key}" AND comment is not EMPTY'),
-        "withSubtasks": bucket(f'project = "{key}" AND issueFunction in hasSubtasks()')
-            if False else None,  # issueFunction requires ScriptRunner; skip by default
-        "withLinks": bucket(f'project = "{key}" AND issueLinkType is not EMPTY')
-            if False else None,
-        "withFixVersion": bucket(f'project = "{key}" AND fixVersion is not EMPTY'),
-        "withComponents": bucket(f'project = "{key}" AND component is not EMPTY'),
-        "withSprint": bucket(f'project = "{key}" AND sprint is not EMPTY'),
-    }
-
-
-def _bucketed(client: JiraClient, key: str, field_name: str) -> Dict[str, int]:
-    """Get counts grouped by a field. We do this by scanning a single fetch
-    of the field's distinct values rather than N approximate-count calls."""
-    out: Dict[str, int] = {}
-    for issue in client.search_jql(f'project = "{key}"', fields=[field_name]):
-        val = issue["fields"].get(field_name)
-        if isinstance(val, dict):
-            name = val.get("name") or val.get("value") or "<unknown>"
-        elif val is None:
-            name = "<empty>"
-        else:
-            name = str(val)
-        out[name] = out.get(name, 0) + 1
     return out
 
 
 def cmd_extract(cfg: Config) -> None:
     client = JiraClient(cfg.base_url, cfg.email, cfg.api_token)
+    verify_auth(client)
+    verify_project_exists(client, cfg.source_key, "Source")
+
     out = cfg.output_dir / "extract"
     out.mkdir(parents=True, exist_ok=True)
-
     logging.info("=== EXTRACT phase: source project %s ===", cfg.source_key)
 
     meta = extract_project_meta(client, cfg.source_key)
     write_json(out / "01_project_meta.json", meta)
     if meta.get("style") != "next-gen":
-        logging.warning("Source project style is '%s' (not 'next-gen' / TMP). "
-                        "Proceeding anyway.", meta.get("style"))
-
-    types = extract_issue_types_in_use(client, cfg.source_key)
-    write_json(out / "02_issue_types.json", types)
-    write_csv(out / "02_issue_types.csv", types,
-              ["id", "name", "subtask", "hierarchyLevel"])
-
-    statuses = extract_statuses_in_use(client, cfg.source_key)
-    write_json(out / "03_statuses.json", statuses)
-    write_csv(out / "03_statuses.csv", statuses,
-              ["issueType", "statusName", "statusId", "statusCategory"])
+        logging.warning("Source style is '%s' (expected 'next-gen' for TMP).",
+                        meta.get("style"))
 
     versions = extract_versions(client, cfg.source_key)
     write_json(out / "04_versions.json", versions)
@@ -513,21 +592,33 @@ def cmd_extract(cfg: Config) -> None:
         write_csv(out / "07_sprints.csv", sprints,
                   ["id", "name", "state", "startDate", "endDate",
                    "completeDate", "goal", "originBoardId"])
-        board_cfg = extract_board_config(client, board["id"])
+        board_cfg = client.get(f"/rest/agile/1.0/board/{board['id']}/configuration")
         write_json(out / "08_source_board_config.json", board_cfg)
     else:
-        logging.warning("No board found on source project; skipping sprint extract.")
+        logging.warning("No board on source; skipping sprint extract.")
 
     roles = extract_roles(client, cfg.source_key)
     write_json(out / "09_roles.json", roles)
 
-    fields = extract_custom_fields_in_use(client, cfg.source_key)
-    write_json(out / "10_custom_fields_in_use.json", fields)
-    write_csv(out / "10_custom_fields_in_use.csv", fields,
-              ["fieldId", "displayName", "schemaType", "schemaCustom", "exampleValue"])
-
-    inv = extract_inventory_counts(client, cfg.source_key)
-    write_json(out / "11_inventory_baseline.json", inv)
+    # Single-pass scan: issue types, statuses, custom fields, inventory
+    scan = scan_source(client, cfg.source_key)
+    write_json(out / "02_issue_types.json", scan["issue_types"])
+    write_csv(out / "02_issue_types.csv", scan["issue_types"],
+              ["id", "name", "subtask", "hierarchyLevel"])
+    write_json(out / "03_statuses.json", scan["statuses"])
+    write_csv(out / "03_statuses.csv", scan["statuses"],
+              ["issueType", "statusName", "statusId", "statusCategory"])
+    write_json(out / "10_custom_fields_in_use.json", scan["custom_fields"])
+    write_csv(out / "10_custom_fields_in_use.csv", scan["custom_fields"],
+              ["fieldId", "displayName", "schemaType",
+               "schemaCustom", "exampleValue"])
+    inventory = {
+        **scan["counters"],
+        "byType": scan["by_type"],
+        "byStatus": scan["by_status"],
+        "byResolution": scan["by_resolution"],
+    }
+    write_json(out / "11_inventory_baseline.json", inventory)
 
     logging.info("Extract complete. Artifacts in %s", out)
 
@@ -544,31 +635,31 @@ def precheck_key_field(client: JiraClient, field_id: str) -> Dict[str, Any]:
     schema_type = (found.get("schema") or {}).get("type")
     if schema_type not in ("string", "any"):
         raise SystemExit(
-            f"Field {field_id} ('{found.get('name')}') has schema.type='{schema_type}'. "
-            "Must be a text (string) field."
+            f"Field {field_id} ('{found.get('name')}') has schema.type="
+            f"'{schema_type}'. Must be a text (string) field."
         )
     logging.info("Key field OK: %s = '%s' (type=%s)",
                  field_id, found.get("name"), schema_type)
     return found
 
 
-def stamp_test_on_first_issue(client: JiraClient, source_key: str,
-                              field_id: str, dry_run: bool) -> str:
-    """Stamp the first issue we find, then read it back. Aborts if not persisted."""
-    first = next(client.search_jql(f'project = "{source_key}" ORDER BY created ASC',
-                                    fields=["summary"]), None)
+def stamp_test_first(client: JiraClient, source_key: str,
+                     field_id: str, dry_run: bool) -> str:
+    first = next(
+        client.search_jql(f'project = "{source_key}" ORDER BY created ASC',
+                          fields=["summary"]),
+        None,
+    )
     if not first:
         raise SystemExit(f"No issues found in source project {source_key}.")
     issue_key = first["key"]
-    logging.info("Test stamp on %s", issue_key)
     if dry_run:
-        logging.info("[DRY-RUN] Would stamp %s into %s on %s",
-                     issue_key, field_id, issue_key)
+        logging.info("[DRY-RUN] Would test-stamp %s", issue_key)
         return issue_key
+    logging.info("Test stamp on %s", issue_key)
     client.put(f"/rest/api/3/issue/{issue_key}",
                body={"fields": {field_id: issue_key}},
                params={"notifyUsers": "false"})
-    # Read back
     check = client.get(f"/rest/api/3/issue/{issue_key}",
                        params={"fields": field_id})
     actual = check["fields"].get(field_id)
@@ -576,7 +667,8 @@ def stamp_test_on_first_issue(client: JiraClient, source_key: str,
         raise SystemExit(
             f"Test stamp did not persist on {issue_key}. "
             f"Expected '{issue_key}', got '{actual}'. "
-            f"Confirm {field_id} is on the edit screen of all issue types in source."
+            f"Confirm {field_id} is on the edit screen of all issue types "
+            f"in source TMP."
         )
     logging.info("Test stamp verified on %s", issue_key)
     return issue_key
@@ -584,28 +676,30 @@ def stamp_test_on_first_issue(client: JiraClient, source_key: str,
 
 def cmd_stamp_keys(cfg: Config) -> None:
     client = JiraClient(cfg.base_url, cfg.email, cfg.api_token)
+    verify_auth(client)
+    verify_project_exists(client, cfg.source_key, "Source")
+
     out = cfg.output_dir / "stamp"
     out.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = out / "stamped.txt"
+    checkpoint = out / "stamped.txt"
     failures_path = out / "stamp_failures.csv"
 
     logging.info("=== STAMP-KEYS phase: %s -> %s ===",
                  cfg.source_key, cfg.key_field_id)
 
     precheck_key_field(client, cfg.key_field_id)
-    stamp_test_on_first_issue(client, cfg.source_key, cfg.key_field_id, cfg.dry_run)
+    stamp_test_first(client, cfg.source_key, cfg.key_field_id, cfg.dry_run)
 
     done: set = set()
-    if checkpoint_path.exists():
-        done = set(checkpoint_path.read_text(encoding="utf-8").splitlines())
+    if checkpoint.exists():
+        done = set(checkpoint.read_text(encoding="utf-8").splitlines())
         logging.info("Resuming: %d issues already stamped per checkpoint", len(done))
 
-    total_jql = f'project = "{cfg.source_key}"'
-    total = client.approximate_count(total_jql)
+    total = client.approximate_count(f'project = "{cfg.source_key}"')
     logging.info("Approximate total issues: %d", total)
 
     if not cfg.dry_run and not confirm(
-        f"About to stamp {cfg.key_field_id} on up to {total} issues in {cfg.source_key}. Continue?",
+        f"Stamp {cfg.key_field_id} on up to {total} issues in {cfg.source_key}?",
         cfg.dry_run,
     ):
         logging.info("Aborted by user.")
@@ -613,8 +707,9 @@ def cmd_stamp_keys(cfg: Config) -> None:
 
     failures: List[Dict[str, str]] = []
     count = 0
-    with checkpoint_path.open("a", encoding="utf-8") as ckpt:
-        for issue in client.search_jql(total_jql, fields=["summary"]):
+    with checkpoint.open("a", encoding="utf-8") as ckpt:
+        for issue in client.search_jql(f'project = "{cfg.source_key}"',
+                                        fields=["summary"]):
             key = issue["key"]
             if key in done:
                 continue
@@ -647,7 +742,7 @@ def cmd_stamp_keys(cfg: Config) -> None:
 
 def get_project_or_none(client: JiraClient, key: str) -> Optional[Dict[str, Any]]:
     try:
-        return client.get(f"/rest/api/3/project/{key}")
+        return client.get(f"/rest/api/3/project/{key}", expected_404=True)
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             return None
@@ -657,7 +752,8 @@ def get_project_or_none(client: JiraClient, key: str) -> Optional[Dict[str, Any]
 def create_target_project(client: JiraClient, cfg: Config,
                           source_meta: Dict[str, Any]) -> Dict[str, Any]:
     if not cfg.target_project_lead_account_id:
-        raise SystemExit("--target-lead <accountId> required when --create-target is set.")
+        raise SystemExit("--target-lead <accountId> (or JIRA_TARGET_LEAD env) "
+                         "required when --create-target is set.")
     body = {
         "key": cfg.target_key,
         "name": source_meta["name"] + " (CMP)",
@@ -674,23 +770,28 @@ def create_target_project(client: JiraClient, cfg: Config,
     return client.post("/rest/api/3/project", body=body)
 
 
-def build_versions(client: JiraClient, cfg: Config, target_project_id: str) -> List[Dict[str, Any]]:
+def _existing_by_name(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {x["name"]: x for x in (items or [])}
+
+
+def build_versions(client: JiraClient, cfg: Config,
+                   target_project_id: str) -> List[Dict[str, Any]]:
     src_path = cfg.output_dir / "extract" / "04_versions.json"
     if not src_path.exists():
         logging.warning("No versions extract found; skipping.")
         return []
     versions = read_json(src_path)
-    existing = {v["name"]: v for v in
-                (client.get(f"/rest/api/3/project/{cfg.target_key}/versions") or [])}
+    existing = _existing_by_name(
+        client.get(f"/rest/api/3/project/{cfg.target_key}/versions") or []
+    )
 
     mapping: List[Dict[str, Any]] = []
     for v in versions:
         name = v["name"]
         if name in existing:
-            target_v = existing[name]
             mapping.append({
                 "source_id": v["id"], "source_name": name,
-                "target_id": target_v["id"], "action": "existing",
+                "target_id": existing[name]["id"], "action": "existing",
             })
             logging.info("Version exists, skipping: %s", name)
             continue
@@ -699,19 +800,15 @@ def build_versions(client: JiraClient, cfg: Config, target_project_id: str) -> L
         for opt in ("description", "startDate", "releaseDate"):
             if v.get(opt):
                 body[opt] = v[opt]
-        # Create as unreleased first; flip released/archived after to avoid
-        # "cannot create archived" edge cases.
+
         if cfg.dry_run:
-            logging.info("[DRY-RUN] Create version %s body=%s", name, body)
-            mapping.append({
-                "source_id": v["id"], "source_name": name,
-                "target_id": "(dry-run)", "action": "would-create",
-            })
+            logging.info("[DRY-RUN] Create version %s", name)
+            mapping.append({"source_id": v["id"], "source_name": name,
+                            "target_id": "(dry-run)", "action": "would-create"})
             continue
 
         created = client.post("/rest/api/3/version", body=body)
         target_id = created["id"]
-        # Apply released / archived flags post-create
         if v.get("released") or v.get("archived"):
             patch: Dict[str, Any] = {}
             if v.get("released"):
@@ -722,14 +819,11 @@ def build_versions(client: JiraClient, cfg: Config, target_project_id: str) -> L
                 patch["archived"] = True
             client.put(f"/rest/api/3/version/{target_id}", body=patch)
 
-        mapping.append({
-            "source_id": v["id"], "source_name": name,
-            "target_id": target_id, "action": "created",
-        })
+        mapping.append({"source_id": v["id"], "source_name": name,
+                        "target_id": target_id, "action": "created"})
         time.sleep(SLEEP_BETWEEN_WRITES)
 
-    out_csv = cfg.output_dir / "build" / "version_id_mapping.csv"
-    write_csv(out_csv, mapping,
+    write_csv(cfg.output_dir / "build" / "version_id_mapping.csv", mapping,
               ["source_id", "source_name", "target_id", "action"])
     return mapping
 
@@ -740,43 +834,32 @@ def build_components(client: JiraClient, cfg: Config) -> List[Dict[str, Any]]:
         logging.warning("No components extract found; skipping.")
         return []
     components = read_json(src_path)
-    existing = {c["name"]: c for c in
-                (client.get(f"/rest/api/3/project/{cfg.target_key}/components") or [])}
+    existing = _existing_by_name(
+        client.get(f"/rest/api/3/project/{cfg.target_key}/components") or []
+    )
 
     mapping: List[Dict[str, Any]] = []
     for c in components:
         name = c["name"]
         if name in existing:
-            mapping.append({
-                "source_id": c["id"], "source_name": name,
-                "target_id": existing[name]["id"], "action": "existing",
-            })
+            mapping.append({"source_id": c["id"], "source_name": name,
+                            "target_id": existing[name]["id"], "action": "existing"})
             logging.info("Component exists, skipping: %s", name)
             continue
-        body: Dict[str, Any] = {
-            "name": name,
-            "project": cfg.target_key,
-        }
-        if c.get("description"):
-            body["description"] = c["description"]
-        if c.get("leadAccountId"):
-            body["leadAccountId"] = c["leadAccountId"]
-        if c.get("assigneeType"):
-            body["assigneeType"] = c["assigneeType"]
+        body: Dict[str, Any] = {"name": name, "project": cfg.target_key}
+        for opt in ("description", "leadAccountId", "assigneeType"):
+            if c.get(opt):
+                body[opt] = c[opt]
 
         if cfg.dry_run:
-            logging.info("[DRY-RUN] Create component %s body=%s", name, body)
-            mapping.append({
-                "source_id": c["id"], "source_name": name,
-                "target_id": "(dry-run)", "action": "would-create",
-            })
+            logging.info("[DRY-RUN] Create component %s", name)
+            mapping.append({"source_id": c["id"], "source_name": name,
+                            "target_id": "(dry-run)", "action": "would-create"})
             continue
 
         created = client.post("/rest/api/3/component", body=body)
-        mapping.append({
-            "source_id": c["id"], "source_name": name,
-            "target_id": created["id"], "action": "created",
-        })
+        mapping.append({"source_id": c["id"], "source_name": name,
+                        "target_id": created["id"], "action": "created"})
         time.sleep(SLEEP_BETWEEN_WRITES)
 
     write_csv(cfg.output_dir / "build" / "component_id_mapping.csv", mapping,
@@ -786,9 +869,9 @@ def build_components(client: JiraClient, cfg: Config) -> List[Dict[str, Any]]:
 
 def build_sprints(client: JiraClient, cfg: Config) -> List[Dict[str, Any]]:
     if not cfg.target_board_id:
-        logging.warning("--target-board-id not provided; skipping sprint creation. "
-                        "Create a Scrum board on the target CMP first, then re-run "
-                        "with --target-board-id <id>.")
+        logging.warning("No --target-board-id (or JIRA_TARGET_BOARD_ID). "
+                        "Skipping sprint creation. Create a Scrum board on "
+                        "the target CMP, then re-run.")
         return []
     src_path = cfg.output_dir / "extract" / "07_sprints.json"
     if not src_path.exists():
@@ -796,18 +879,17 @@ def build_sprints(client: JiraClient, cfg: Config) -> List[Dict[str, Any]]:
         return []
     sprints = read_json(src_path)
 
-    # Existing sprints on target board (avoid duplicates)
     try:
-        existing_iter = client.paged(
-            f"/rest/agile/1.0/board/{cfg.target_board_id}/sprint",
-            params={"state": "closed,active,future"}, page_size=50,
-        )
-        existing_by_name = {s["name"]: s for s in existing_iter}
+        existing_by_name = {
+            s["name"]: s for s in client.paged(
+                f"/rest/agile/1.0/board/{cfg.target_board_id}/sprint",
+                params={"state": "closed,active,future"}, page_size=50,
+            )
+        }
     except requests.HTTPError:
         existing_by_name = {}
 
     mapping: List[Dict[str, Any]] = []
-    # Create in order so closed sprints appear chronologically first
     for s in sprints:
         name = s["name"]
         if name in existing_by_name:
@@ -816,25 +898,18 @@ def build_sprints(client: JiraClient, cfg: Config) -> List[Dict[str, Any]]:
                 "source_state": s["state"],
                 "target_id": existing_by_name[name]["id"],
                 "target_state": existing_by_name[name]["state"],
-                "action": "existing",
-                "note": "completeDate cannot be backdated via API",
+                "action": "existing", "note": "",
             })
             continue
 
-        body: Dict[str, Any] = {
-            "name": name,
-            "originBoardId": cfg.target_board_id,
-        }
-        if s.get("startDate"):
-            body["startDate"] = s["startDate"]
-        if s.get("endDate"):
-            body["endDate"] = s["endDate"]
-        if s.get("goal"):
-            body["goal"] = s["goal"]
+        body: Dict[str, Any] = {"name": name,
+                                "originBoardId": cfg.target_board_id}
+        for opt in ("startDate", "endDate", "goal"):
+            if s.get(opt):
+                body[opt] = s[opt]
 
         if cfg.dry_run:
-            logging.info("[DRY-RUN] Create sprint %s (target state: %s) body=%s",
-                         name, s["state"], body)
+            logging.info("[DRY-RUN] Create sprint %s (-> %s)", name, s["state"])
             mapping.append({
                 "source_id": s["id"], "source_name": name,
                 "source_state": s["state"],
@@ -847,13 +922,11 @@ def build_sprints(client: JiraClient, cfg: Config) -> List[Dict[str, Any]]:
         target_id = created["id"]
         target_state = "future"
 
-        # Transition to active/closed to match source state
         if s["state"] == "active":
             client.post(f"/rest/agile/1.0/sprint/{target_id}",
                         body={"state": "active"})
             target_state = "active"
         elif s["state"] == "closed":
-            # Must activate first, then close
             client.post(f"/rest/agile/1.0/sprint/{target_id}",
                         body={"state": "active"})
             client.post(f"/rest/agile/1.0/sprint/{target_id}",
@@ -865,7 +938,8 @@ def build_sprints(client: JiraClient, cfg: Config) -> List[Dict[str, Any]]:
             "source_state": s["state"],
             "target_id": target_id, "target_state": target_state,
             "action": "created",
-            "note": "completeDate set to now, not original" if s["state"] == "closed" else "",
+            "note": ("completeDate set to now, not original"
+                     if s["state"] == "closed" else ""),
         })
         time.sleep(SLEEP_BETWEEN_WRITES)
 
@@ -877,31 +951,35 @@ def build_sprints(client: JiraClient, cfg: Config) -> List[Dict[str, Any]]:
 
 def cmd_build(cfg: Config) -> None:
     client = JiraClient(cfg.base_url, cfg.email, cfg.api_token)
+    verify_auth(client)
+
     out = cfg.output_dir / "build"
     out.mkdir(parents=True, exist_ok=True)
-
     logging.info("=== BUILD phase: target %s ===", cfg.target_key)
 
     target = get_project_or_none(client, cfg.target_key)
-    source_meta = read_json(cfg.output_dir / "extract" / "01_project_meta.json")
+    source_meta_path = cfg.output_dir / "extract" / "01_project_meta.json"
+    if not source_meta_path.exists():
+        raise SystemExit("No extract artifacts found. Run 'extract' first.")
+    source_meta = read_json(source_meta_path)
 
     if target is None:
         if not cfg.create_target:
             raise SystemExit(
-                f"Target project {cfg.target_key} not found. "
-                f"Create it via UI (recommended, to assign schemes), "
-                f"or re-run with --create-target --target-lead <accountId>."
+                f"Target project '{cfg.target_key}' not found on "
+                f"{cfg.base_url}.\n"
+                f"  - Create it in the Jira UI (recommended, lets you assign "
+                f"schemes), OR\n"
+                f"  - Re-run with --create-target --target-lead <accountId>."
             )
         target = create_target_project(client, cfg, source_meta)
     else:
-        logging.info("Target project %s exists (id=%s)", target["key"], target.get("id"))
+        logging.info("Target project %s exists (id=%s, style=%s)",
+                     target["key"], target["id"], target.get("style", "?"))
 
-    target_id = str(target["id"])
-
-    build_versions(client, cfg, target_id)
+    build_versions(client, cfg, str(target["id"]))
     build_components(client, cfg)
     build_sprints(client, cfg)
-
     logging.info("Build complete. Mappings in %s", out)
 
 
@@ -911,6 +989,9 @@ def cmd_build(cfg: Config) -> None:
 
 def cmd_validate(cfg: Config) -> None:
     client = JiraClient(cfg.base_url, cfg.email, cfg.api_token)
+    verify_auth(client)
+    verify_project_exists(client, cfg.target_key, "Target")
+
     out = cfg.output_dir / "validate"
     out.mkdir(parents=True, exist_ok=True)
 
@@ -919,43 +1000,39 @@ def cmd_validate(cfg: Config) -> None:
         raise SystemExit("Baseline inventory not found. Run 'extract' first.")
     baseline = read_json(baseline_path)
 
-    target_inv = extract_inventory_counts(client, cfg.target_key)
+    scan = scan_source(client, cfg.target_key)
+    target_inv = {
+        **scan["counters"],
+        "byType": scan["by_type"],
+        "byStatus": scan["by_status"],
+        "byResolution": scan["by_resolution"],
+    }
     write_json(out / "target_inventory.json", target_inv)
 
-    delta = {
-        "total": {"source": baseline["total"], "target": target_inv["total"],
-                  "diff": target_inv["total"] - baseline["total"]},
-        "byType": _dict_diff(baseline["byType"], target_inv["byType"]),
-        "byStatus": _dict_diff(baseline["byStatus"], target_inv["byStatus"]),
-        "byResolution": _dict_diff(baseline["byResolution"], target_inv["byResolution"]),
-        "withAttachments": {"source": baseline["withAttachments"],
-                            "target": target_inv["withAttachments"]},
-        "withComments": {"source": baseline["withComments"],
-                         "target": target_inv["withComments"]},
-        "withFixVersion": {"source": baseline["withFixVersion"],
-                           "target": target_inv["withFixVersion"]},
-        "withComponents": {"source": baseline["withComponents"],
-                           "target": target_inv["withComponents"]},
-        "withSprint": {"source": baseline["withSprint"],
-                       "target": target_inv["withSprint"]},
-    }
+    def diff_dict(src: Dict[str, int], tgt: Dict[str, int]) -> Dict[str, Dict[str, int]]:
+        return {k: {"source": src.get(k, 0), "target": tgt.get(k, 0),
+                    "diff": tgt.get(k, 0) - src.get(k, 0)}
+                for k in sorted(set(src) | set(tgt))}
+
+    flat_keys = ("total", "withAttachments", "withComments",
+                 "withFixVersion", "withComponents", "withSprint")
+    delta = {k: {"source": baseline.get(k, 0), "target": target_inv.get(k, 0),
+                 "diff": target_inv.get(k, 0) - baseline.get(k, 0)}
+             for k in flat_keys}
+    delta["byType"] = diff_dict(baseline.get("byType", {}),
+                                 target_inv.get("byType", {}))
+    delta["byStatus"] = diff_dict(baseline.get("byStatus", {}),
+                                   target_inv.get("byStatus", {}))
+    delta["byResolution"] = diff_dict(baseline.get("byResolution", {}),
+                                       target_inv.get("byResolution", {}))
     write_json(out / "validation_delta.json", delta)
 
-    # Human-readable summary
     lines = ["category,source,target,diff"]
-    for k in ("total", "withAttachments", "withComments",
-              "withFixVersion", "withComponents", "withSprint"):
-        s = delta[k].get("source", 0)
-        t = delta[k].get("target", 0)
-        lines.append(f"{k},{s},{t},{t - s}")
+    for k in flat_keys:
+        d = delta[k]
+        lines.append(f"{k},{d['source']},{d['target']},{d['diff']}")
     (out / "validation_summary.csv").write_text("\n".join(lines), encoding="utf-8")
     logging.info("Validation complete. See %s", out)
-
-
-def _dict_diff(src: Dict[str, int], tgt: Dict[str, int]) -> Dict[str, Dict[str, int]]:
-    keys = set(src) | set(tgt)
-    return {k: {"source": src.get(k, 0), "target": tgt.get(k, 0),
-                "diff": tgt.get(k, 0) - src.get(k, 0)} for k in sorted(keys)}
 
 
 # ---------------------------------------------------------------------------
@@ -963,55 +1040,80 @@ def _dict_diff(src: Dict[str, int], tgt: Dict[str, int]) -> Dict[str, Dict[str, 
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Jira TMP -> CMP migration toolkit")
-    p.add_argument("--base-url", help="Jira Cloud base URL (e.g. https://acme.atlassian.net). "
-                                       "Or set JIRA_BASE_URL env.")
-    p.add_argument("--email", help="Atlassian account email. Or set JIRA_EMAIL env.")
-    p.add_argument("--output-dir", default="./out", help="Artifacts output directory.")
+    p = argparse.ArgumentParser(
+        description="Jira TMP -> CMP migration toolkit (env-driven; loads .env on each run)")
+    p.add_argument("--env-file", help="Path to .env (default: ./.env or alongside script)")
+    p.add_argument("--base-url", help="Override JIRA_BASE_URL")
+    p.add_argument("--email", help="Override JIRA_EMAIL")
+    p.add_argument("--output-dir", help="Override JIRA_OUTPUT_DIR (default ./out)")
     p.add_argument("--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_ext = sub.add_parser("extract", help="Extract source TMP data.")
-    p_ext.add_argument("--source-key", required=True)
+    p_ext.add_argument("--source-key", help="Override JIRA_SOURCE_KEY")
 
-    p_stamp = sub.add_parser("stamp-keys", help="Stamp issue keys into a text custom field.")
-    p_stamp.add_argument("--source-key", required=True)
-    p_stamp.add_argument("--key-field", default="customfield_25199")
+    p_stamp = sub.add_parser("stamp-keys",
+                              help="Stamp issue keys into text custom field.")
+    p_stamp.add_argument("--source-key", help="Override JIRA_SOURCE_KEY")
+    p_stamp.add_argument("--key-field", help="Override JIRA_KEY_FIELD")
     p_stamp.add_argument("--dry-run", action="store_true")
 
-    p_build = sub.add_parser("build", help="Recreate versions/components/sprints in target.")
-    p_build.add_argument("--target-key", required=True)
+    p_build = sub.add_parser("build",
+                              help="Recreate versions/components/sprints in target.")
+    p_build.add_argument("--target-key", help="Override JIRA_TARGET_KEY")
     p_build.add_argument("--target-board-id", type=int,
-                         help="Board ID on target CMP for sprint creation.")
+                         help="Override JIRA_TARGET_BOARD_ID")
     p_build.add_argument("--create-target", action="store_true",
-                         help="Create the target project if it doesn't exist.")
-    p_build.add_argument("--target-lead", help="Lead accountId (required with --create-target).")
-    p_build.add_argument("--target-template",
-                         default="com.pyxis.greenhopper.jira:gh-simplified-scrum-classic",
-                         help="Project template when --create-target.")
+                         help="Create target if it doesn't exist (limited scheme control).")
+    p_build.add_argument("--target-lead", help="Lead accountId for --create-target.")
+    p_build.add_argument("--target-template", help="Project template for --create-target.")
     p_build.add_argument("--dry-run", action="store_true")
 
-    p_val = sub.add_parser("validate", help="Compare baseline vs target inventory.")
-    p_val.add_argument("--source-key", required=True,
-                       help="(for label only; baseline is read from extract artifacts)")
-    p_val.add_argument("--target-key", required=True)
+    p_val = sub.add_parser("validate",
+                            help="Compare baseline vs target inventory.")
+    p_val.add_argument("--source-key", help="Override JIRA_SOURCE_KEY (label only)")
+    p_val.add_argument("--target-key", help="Override JIRA_TARGET_KEY")
 
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    output_dir = Path(args.output_dir).resolve()
+    # Load .env FIRST so cfg can read from os.environ
+    loaded = load_dotenv(getattr(args, "env_file", None))
+    output_dir = Path(getattr(args, "output_dir", None)
+                      or os.environ.get("JIRA_OUTPUT_DIR")
+                      or "./out").resolve()
     setup_logging(output_dir, args.verbose)
-    cfg = Config.from_args(args)
+    if loaded:
+        logging.info("Loaded env from %s", loaded)
+    else:
+        logging.info("No .env file found; using shell environment only.")
+
+    try:
+        cfg = Config.from_args(args)
+    except SystemExit:
+        raise
+    except Exception:
+        logging.exception("Config error")
+        return 2
+
     try:
         if args.cmd == "extract":
+            if not cfg.source_key:
+                raise SystemExit("source key required (JIRA_SOURCE_KEY or --source-key).")
             cmd_extract(cfg)
         elif args.cmd == "stamp-keys":
+            if not cfg.source_key:
+                raise SystemExit("source key required (JIRA_SOURCE_KEY or --source-key).")
             cmd_stamp_keys(cfg)
         elif args.cmd == "build":
+            if not cfg.target_key:
+                raise SystemExit("target key required (JIRA_TARGET_KEY or --target-key).")
             cmd_build(cfg)
         elif args.cmd == "validate":
+            if not cfg.target_key:
+                raise SystemExit("target key required (JIRA_TARGET_KEY or --target-key).")
             cmd_validate(cfg)
         else:
             raise SystemExit(f"Unknown command: {args.cmd}")
