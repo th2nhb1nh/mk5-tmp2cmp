@@ -35,6 +35,14 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Try to load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # This loads .env file from current directory
+except ImportError:
+    # python-dotenv not installed, continue without it
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -86,34 +94,66 @@ class Config:
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "Config":
-        base = (os.environ.get("JIRA_BASE_URL") or getattr(args, "base_url", "") or "").rstrip("/")
-        email = os.environ.get("JIRA_EMAIL") or getattr(args, "email", "") or ""
-        token = os.environ.get("JIRA_API_TOKEN") or ""
-        missing = [n for n, v in [("JIRA_BASE_URL", base),
-                                   ("JIRA_EMAIL", email),
-                                   ("JIRA_API_TOKEN", token)] if not v]
+        # Priority: CLI args > environment variables
+        base = (getattr(args, "base_url", "") or 
+                os.environ.get("JIRA_BASE_URL", "")).rstrip("/")
+        email = (getattr(args, "email", "") or 
+                 os.environ.get("JIRA_EMAIL", ""))
+        token = os.environ.get("JIRA_API_TOKEN", "")
+        
+        missing = []
+        if not base:
+            missing.append("JIRA_BASE_URL")
+        if not email:
+            missing.append("JIRA_EMAIL")
+        if not token:
+            missing.append("JIRA_API_TOKEN")
+            
         if missing:
             raise SystemExit(
                 f"\nMissing credentials: {', '.join(missing)}\n"
-                f"Set env vars (see .env.example) or pass --base-url / --email.\n"
+                f"Set them in .env file or pass via CLI arguments.\n"
+                f"Example .env:\n"
+                f'JIRA_BASE_URL="https://mysite.atlassian.net"\n'
+                f'JIRA_EMAIL="your-email@example.com"\n'
+                f'JIRA_API_TOKEN="your-api-token"\n'
             )
+        
+        output_dir = Path(getattr(args, "output_dir", None) or 
+                         os.environ.get("JIRA_OUTPUT_DIR", "./out")).resolve()
+        
+        source_key = getattr(args, "source_key", "") or os.environ.get("JIRA_SOURCE_KEY", "")
+        target_key = getattr(args, "target_key", "") or os.environ.get("JIRA_TARGET_KEY", "")
+        key_field_id = (getattr(args, "key_field", None) or 
+                       os.environ.get("JIRA_KEY_FIELD", "customfield_25199"))
+        
         return cls(
             base_url=base,
             email=email,
             api_token=token,
-            source_key=getattr(args, "source_key", "") or "",
-            target_key=getattr(args, "target_key", "") or "",
-            key_field_id=getattr(args, "key_field", None) or "customfield_25199",
-            output_dir=Path(getattr(args, "output_dir", "./out")).resolve(),
+            source_key=source_key,
+            target_key=target_key,
+            key_field_id=key_field_id,
+            output_dir=output_dir,
             dry_run=getattr(args, "dry_run", False),
             create_target=getattr(args, "create_target", False),
-            target_board_id=getattr(args, "target_board_id", None),
-            target_lead_account_id=getattr(args, "target_lead", None),
-            target_template=getattr(
-                args, "target_template",
-                "com.pyxis.greenhopper.jira:gh-simplified-scrum-classic",
-            ),
+            target_board_id=(getattr(args, "target_board_id", None) or
+                            _to_int_or_none(os.environ.get("JIRA_TARGET_BOARD_ID"))),
+            target_lead_account_id=(getattr(args, "target_lead", None) or
+                                   os.environ.get("JIRA_TARGET_LEAD")),
+            target_template=(getattr(args, "target_template", None) or
+                           os.environ.get("JIRA_TARGET_TEMPLATE", 
+                                        "com.pyxis.greenhopper.jira:gh-simplified-scrum-classic")),
         )
+
+
+def _to_int_or_none(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +192,6 @@ class JiraClient:
         if resp.status_code >= 400:
             final = resp.url
             redirect_note = f" (redirected to {final})" if final != original else ""
-            # Surface the request body on errors — invaluable for 400 debugging.
             req_body = ""
             if kwargs.get("json") is not None:
                 try:
@@ -222,19 +261,7 @@ class JiraClient:
                    fields_by_keys: bool = False,
                    properties: Optional[List[str]] = None
                    ) -> Iterable[Dict[str, Any]]:
-        """Iterate issues via POST /rest/api/3/search/jql.
-
-        Aligns with the official spec:
-          - 'expand'         -> comma-separated STRING (e.g. "names,schema"), not array
-          - 'fields'         -> array of strings
-          - 'fieldsByKeys'   -> boolean
-          - 'jql'            -> string (must be bounded; project filter satisfies this)
-          - 'maxResults'     -> integer
-          - 'nextPageToken'  -> string; omitted on first request (null is rejected)
-          - 'properties'     -> array of strings
-          - 'startAt'        -> deprecated; MUST NOT be sent
-        """
-        # Defensive: accept list for expand but coerce to spec-compliant string.
+        """Iterate issues via POST /rest/api/3/search/jql."""
         if isinstance(expand, (list, tuple)):
             expand = ",".join(expand)
 
@@ -252,7 +279,6 @@ class JiraClient:
         token: Optional[str] = None
         while True:
             body = dict(body_base)
-            # First page MUST omit nextPageToken entirely — null is rejected.
             if token:
                 body["nextPageToken"] = token
             payload = self.post("/rest/api/3/search/jql", body=body) or {}
@@ -294,7 +320,7 @@ def preflight(client: JiraClient,
             f"Check the URL and your network.\n"
         )
 
-    logging.info("Authenticated OK")
+    logging.info("Authentication successful")
     logging.info("  User:      %s", me.get("displayName"))
     logging.info("  Email:     %s", me.get("emailAddress"))
     logging.info("  AccountId: %s", me.get("accountId"))
@@ -1139,34 +1165,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--base-url", help="(or set JIRA_BASE_URL)")
     p.add_argument("--email", help="(or set JIRA_EMAIL)")
-    p.add_argument("--output-dir", default="./out")
+    p.add_argument("--output-dir", default="./out", help="(or set JIRA_OUTPUT_DIR)")
     p.add_argument("--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pd = sub.add_parser("doctor", help="Verify auth + project access.")
-    pd.add_argument("--source-key", default="")
-    pd.add_argument("--target-key", default="")
-    pd.add_argument("--key-field", default="customfield_25199")
+    pd.add_argument("--source-key", help="(or set JIRA_SOURCE_KEY)")
+    pd.add_argument("--target-key", help="(or set JIRA_TARGET_KEY)")
+    pd.add_argument("--key-field", help="(or set JIRA_KEY_FIELD, default customfield_25199)")
 
     pe = sub.add_parser("extract", help="Extract source TMP data.")
-    pe.add_argument("--source-key", required=True)
+    pe.add_argument("--source-key", help="(or set JIRA_SOURCE_KEY)", required=False)
 
     ps = sub.add_parser("stamp-keys", help="Stamp issue keys into a text custom field.")
-    ps.add_argument("--source-key", required=True)
-    ps.add_argument("--key-field", default="customfield_25199")
+    ps.add_argument("--source-key", help="(or set JIRA_SOURCE_KEY)", required=False)
+    ps.add_argument("--key-field", help="(or set JIRA_KEY_FIELD, default customfield_25199)")
     ps.add_argument("--dry-run", action="store_true")
 
     pb = sub.add_parser("build", help="Recreate versions/components/sprints in target.")
-    pb.add_argument("--target-key", required=True)
-    pb.add_argument("--target-board-id", type=int)
+    pb.add_argument("--target-key", help="(or set JIRA_TARGET_KEY)", required=False)
+    pb.add_argument("--target-board-id", type=int, help="(or set JIRA_TARGET_BOARD_ID)")
     pb.add_argument("--create-target", action="store_true")
-    pb.add_argument("--target-lead")
-    pb.add_argument("--target-template",
-                    default="com.pyxis.greenhopper.jira:gh-simplified-scrum-classic")
+    pb.add_argument("--target-lead", help="(or set JIRA_TARGET_LEAD)")
+    pb.add_argument("--target-template", help="(or set JIRA_TARGET_TEMPLATE)")
     pb.add_argument("--dry-run", action="store_true")
 
     pv = sub.add_parser("validate", help="Compare baseline vs target inventory.")
-    pv.add_argument("--target-key", required=True)
+    pv.add_argument("--target-key", help="(or set JIRA_TARGET_KEY)", required=False)
 
     return p
 
