@@ -758,36 +758,301 @@ def cmd_build(cfg: Config) -> None:
     logging.info("BUILD complete. Mappings in %s", out)
 
 # ---------------------------------------------------------------------------
+# UPDATE SPRINTS
+# ---------------------------------------------------------------------------
+def cmd_update_sprints(cfg: Config) -> None:
+    """Replace source sprint IDs with target sprint IDs on all issues in target project."""
+    client = JiraClient(cfg.base_url, cfg.email, cfg.api_token)
+    preflight(client, target_key=cfg.target_key, target_must_exist=True)
+
+    mapping_path = cfg.output_dir / "build" / "sprint_id_mapping.csv"
+    if not mapping_path.exists():
+        raise SystemExit(f"Sprint mapping not found: {mapping_path}. Run 'build' first.")
+
+    # Build source_id -> target_id mapping
+    sprint_map = {}
+    with mapping_path.open() as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["action"] in ("created", "existing"):
+                sprint_map[row["source_id"]] = row["target_id"]
+
+    if not sprint_map:
+        logging.warning("No sprint mappings found. Nothing to update.")
+        return
+
+    out = cfg.output_dir / "update_sprints"
+    out.mkdir(parents=True, exist_ok=True)
+    checkpoint = out / "updated.txt"
+    done = set(checkpoint.read_text().splitlines()) if checkpoint.exists() else set()
+
+    # Find all issues that have sprint field populated
+    jql = f'project = "{cfg.target_key}" AND sprint is not EMPTY'
+    total = client.approximate_count(jql)
+    logging.info("Found %d issues with sprints in target project", total)
+
+    failures = []
+    updated = 0
+    for issue in client.search_jql(jql, fields=["sprint"]):
+        key = issue["key"]
+        if key in done:
+            continue
+
+        # Extract sprint field: can be an array of sprint objects or IDs
+        sprint_field = issue["fields"].get("sprint")
+        if not sprint_field:
+            continue
+
+        # sprint_field is typically a list of dicts with 'id' key
+        source_sprint_ids = []
+        if isinstance(sprint_field, list):
+            for s in sprint_field:
+                sid = str(s.get("id", ""))
+                if sid:
+                    source_sprint_ids.append(sid)
+        elif isinstance(sprint_field, dict):
+            sid = str(sprint_field.get("id", ""))
+            if sid:
+                source_sprint_ids = [sid]
+        else:
+            # Maybe comma-separated string? Not typical.
+            logging.warning("Unexpected sprint field format on %s: %s", key, type(sprint_field))
+            continue
+
+        target_sprint_ids = []
+        missing = []
+        for sid in source_sprint_ids:
+            if sid in sprint_map:
+                target_sprint_ids.append(sprint_map[sid])
+            else:
+                missing.append(sid)
+        if missing:
+            logging.warning("Issue %s: source sprint IDs %s have no target mapping", key, missing)
+            # Skip updating if any missing? Decide to continue without those.
+        if not target_sprint_ids:
+            continue
+
+        # Prepare update: set sprint field to array of IDs
+        # Jira expects sprint field to be set as an array of sprint IDs (integers)
+        update_body = {"fields": {"sprint": [int(tid) for tid in target_sprint_ids]}}
+        try:
+            if not cfg.dry_run:
+                client.put(f"/rest/api/3/issue/{key}", body=update_body, params={"notifyUsers": "false"})
+                with checkpoint.open("a") as ckpt:
+                    ckpt.write(key + "\n")
+                time.sleep(SLEEP_BETWEEN_WRITES)
+            updated += 1
+            if updated % 50 == 0:
+                logging.info("Updated sprints for %d issues", updated)
+        except Exception as e:
+            failures.append({"issue": key, "error": str(e)[:300]})
+            logging.warning("Failed to update sprints on %s: %s", key, e)
+
+    if failures:
+        write_csv(out / "failures.csv", failures, ["issue", "error"])
+    logging.info("UPDATE-SPRINTS complete. Updated %d issues.", updated)
+
+# ---------------------------------------------------------------------------
 # VALIDATE
 # ---------------------------------------------------------------------------
 def cmd_validate(cfg: Config) -> None:
+    """
+    Compare source baseline (extracted earlier) with current target project state.
+    Validates:
+      - Issue counts (total, by type, by status, by resolution)
+      - Presence of attachments, comments, fixVersion, components, sprints (boolean buckets)
+      - Sprint membership consistency (if sprint mapping exists from build)
+      - Custom field values for a sample of issues (if field mapping CSV exists)
+    """
     client = JiraClient(cfg.base_url, cfg.email, cfg.api_token)
     preflight(client, target_key=cfg.target_key, target_must_exist=True)
-    baseline = read_json(cfg.output_dir / "extract" / "11_inventory_baseline.json")
+
+    # --- 1. Load baseline from extract phase ---
+    baseline_path = cfg.output_dir / "extract" / "11_inventory_baseline.json"
+    if not baseline_path.exists():
+        raise SystemExit("Baseline not found. Run 'extract' first.")
+    baseline = read_json(baseline_path)
+
+    out_dir = cfg.output_dir / "validate"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- 2. Gather current target statistics ---
+    logging.info("Scanning target project %s...", cfg.target_key)
     agg = extract_issues_aggregate(client, cfg.target_key)
     buckets = extract_boolean_buckets(client, cfg.target_key)
-    target_inv = {"projectKey": cfg.target_key, "scannedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                  "total": agg["total"], "byType": agg["byType"], "byStatus": agg["byStatus"],
-                  "byResolution": agg["byResolution"], **buckets}
-    out = cfg.output_dir / "validate"
-    out.mkdir(parents=True, exist_ok=True)
-    write_json(out / "target_inventory.json", target_inv)
-    delta = {"total": _diff(baseline["total"], target_inv["total"]),
-             "withAttachments": _diff(baseline["withAttachments"], target_inv["withAttachments"]),
-             "withComments": _diff(baseline["withComments"], target_inv["withComments"]),
-             "withFixVersion": _diff(baseline["withFixVersion"], target_inv["withFixVersion"]),
-             "withComponents": _diff(baseline["withComponents"], target_inv["withComponents"]),
-             "withSprint": _diff(baseline["withSprint"], target_inv["withSprint"])}
-    write_json(out / "validation_delta.json", delta)
-    non_zero = [k for k in delta if delta[k]["diff"] != 0]
-    if non_zero:
-        logging.warning("Validation differences: %s", non_zero)
+
+    target_inv = {
+        "projectKey": cfg.target_key,
+        "scannedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "total": agg["total"],
+        "byType": agg["byType"],
+        "byStatus": agg["byStatus"],
+        "byResolution": agg["byResolution"],
+        **buckets,
+    }
+    write_json(out_dir / "target_inventory.json", target_inv)
+
+    # --- 3. Compute deltas for aggregate counts ---
+    delta = {
+        "total": _diff(baseline["total"], target_inv["total"]),
+        "byType": _dict_diff(baseline["byType"], target_inv["byType"]),
+        "byStatus": _dict_diff(baseline["byStatus"], target_inv["byStatus"]),
+        "byResolution": _dict_diff(baseline["byResolution"], target_inv["byResolution"]),
+        "withAttachments": _diff(baseline["withAttachments"], target_inv["withAttachments"]),
+        "withComments": _diff(baseline["withComments"], target_inv["withComments"]),
+        "withFixVersion": _diff(baseline["withFixVersion"], target_inv["withFixVersion"]),
+        "withComponents": _diff(baseline["withComponents"], target_inv["withComponents"]),
+        "withSprint": _diff(baseline["withSprint"], target_inv["withSprint"]),
+    }
+    write_json(out_dir / "validation_delta.json", delta)
+
+    # --- 4. Write human-readable summary CSV ---
+    summary_lines = ["category,source,target,diff"]
+    for cat in ("total", "withAttachments", "withComments", "withFixVersion", "withComponents", "withSprint"):
+        d = delta[cat]
+        summary_lines.append(f"{cat},{d['source']},{d['target']},{d['diff']}")
+    (out_dir / "validation_summary.csv").write_text("\n".join(summary_lines), encoding="utf-8")
+
+    # --- 5. Sprint membership validation (if mapping exists) ---
+    sprint_map_path = cfg.output_dir / "build" / "sprint_id_mapping.csv"
+    if sprint_map_path.exists():
+        sprint_map = {}
+        with sprint_map_path.open() as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row["action"] in ("created", "existing"):
+                    sprint_map[row["source_id"]] = row["target_id"]
+        if sprint_map:
+            logging.info("Validating sprint membership...")
+            mismatches = _validate_sprint_membership(client, cfg.source_key, cfg.target_key,
+                                                      sprint_map, cfg.key_field_id)
+            if mismatches:
+                write_json(out_dir / "sprint_mismatches.json", mismatches)
+                logging.warning("Sprint membership mismatches found: %d sprints with count differences", len(mismatches))
+            else:
+                logging.info("Sprint membership validation passed (counts match for all mapped sprints).")
+        else:
+            logging.info("No active sprint mappings found, skipping sprint membership validation.")
     else:
-        logging.info("Validation: all counts match.")
-    logging.info("VALIDATE complete.")
+        logging.info("No sprint mapping file found, skipping sprint membership validation.")
+
+    # --- 6. Optional field value sampling (if mapping CSV exists) ---
+    field_mapping_path = cfg.output_dir / "mapping" / "field_mapping.csv"
+    if field_mapping_path.exists():
+        logging.info("Validating custom field values (sampling up to 50 issues)...")
+        field_mismatches = _validate_field_values(client, cfg.source_key, cfg.target_key,
+                                                   cfg.key_field_id, field_mapping_path)
+        if field_mismatches:
+            write_json(out_dir / "field_mismatches.json", field_mismatches)
+            logging.warning("Field value mismatches found in sample. See field_mismatches.json")
+        else:
+            logging.info("Field value sampling passed (sample values match).")
+    else:
+        logging.info("No field mapping CSV found, skipping custom field validation.")
+
+    # --- 7. Final verdict ---
+    non_zero = [cat for cat in ("total", "withAttachments", "withComments", "withFixVersion", "withComponents", "withSprint")
+                if delta[cat]["diff"] != 0]
+    if non_zero:
+        logging.warning("VALIDATION COMPLETE – Differences found in: %s", ", ".join(non_zero))
+    else:
+        logging.info("VALIDATION COMPLETE – All aggregate counts match. (Sprint/field checks logged separately)")
+    logging.info("Outputs written to %s", out_dir)
+
+
+def _validate_sprint_membership(client: JiraClient, src_key: str, tgt_key: str,
+                                sprint_map: Dict[str, str], key_field_id: str) -> List[Dict]:
+    """
+    For each mapped sprint, compare number of issues in source sprint vs target sprint.
+    Uses the stamped key field to link issues (but for counts we just compare counts).
+    Returns list of mismatches with source_sprint_id, target_sprint_id,
+    source_count, target_count, and optionally first few missing keys.
+    """
+    mismatches = []
+    for src_id, tgt_id in sprint_map.items():
+        # Count issues in source sprint
+        src_jql = f'project = "{src_key}" AND sprint = {src_id}'
+        src_count = client.approximate_count(src_jql)
+        if src_count == 0:
+            continue
+
+        # Count issues in target sprint
+        tgt_jql = f'project = "{tgt_key}" AND sprint = {tgt_id}'
+        tgt_count = client.approximate_count(tgt_jql)
+
+        if src_count != tgt_count:
+            mismatches.append({
+                "source_sprint_id": src_id,
+                "target_sprint_id": tgt_id,
+                "source_issue_count": src_count,
+                "target_issue_count": tgt_count,
+                "difference": tgt_count - src_count
+            })
+    return mismatches
+
+
+def _validate_field_values(client: JiraClient, src_key: str, tgt_key: str,
+                           key_field_id: str, mapping_csv: Path) -> List[Dict]:
+    """
+    Sample up to 50 issues from target, retrieve source issue via stamped key,
+    compare a few mapped fields. Returns list of mismatches.
+    """
+    # Load mapping
+    mappings = []
+    with mapping_csv.open() as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("source_field_id") and row.get("target_field_id"):
+                mappings.append((row["source_field_id"], row["target_field_id"]))
+
+    if not mappings:
+        return []
+
+    # Sample target issues that have stamped source key
+    sample_jql = f'project = "{tgt_key}" AND "{key_field_id}" IS NOT EMPTY'
+    mismatches = []
+    sampled = 0
+    for issue in client.search_jql(sample_jql, fields=[key_field_id] + [tgt for _, tgt in mappings], max_results=50):
+        tgt_key_issue = issue["key"]
+        stamped = issue["fields"].get(key_field_id)
+        if not stamped:
+            continue
+
+        # Fetch source issue
+        try:
+            src_issue = client.get(f"/rest/api/3/issue/{stamped}", params={"fields": ",".join([src for src, _ in mappings])})
+        except Exception as e:
+            mismatches.append({"target_issue": tgt_key_issue, "source_key": stamped, "error": f"Cannot fetch source: {e}"})
+            continue
+
+        # Compare each mapped field
+        for src_field, tgt_field in mappings:
+            src_val = src_issue.get("fields", {}).get(src_field)
+            tgt_val = issue["fields"].get(tgt_field)
+            # Simple equality check; ignore None vs "" vs [] subtlety
+            if src_val != tgt_val:
+                mismatches.append({
+                    "target_issue": tgt_key_issue,
+                    "source_issue": stamped,
+                    "source_field": src_field,
+                    "target_field": tgt_field,
+                    "source_value": str(src_val)[:200],
+                    "target_value": str(tgt_val)[:200]
+                })
+        sampled += 1
+        if sampled % 20 == 0:
+            logging.info("  sampled %d issues for field validation", sampled)
+
+    return mismatches
+
 
 def _diff(src: int, tgt: int) -> Dict[str, int]:
     return {"source": src, "target": tgt, "diff": tgt - src}
+
+
+def _dict_diff(src: Dict[str, int], tgt: Dict[str, int]) -> Dict[str, Dict[str, int]]:
+    all_keys = set(src.keys()) | set(tgt.keys())
+    return {k: _diff(src.get(k, 0), tgt.get(k, 0)) for k in sorted(all_keys)}
 
 # ---------------------------------------------------------------------------
 # DOCTOR
@@ -844,6 +1109,10 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--target-template")
     pb.add_argument("--dry-run", action="store_true")
 
+    pu = sub.add_parser("update-sprints", help="Update sprint field with mapped sprint IDs after bulk move.")
+    pu.add_argument("--target-key", required=False)
+    pu.add_argument("--dry-run", action="store_true")
+
     pv = sub.add_parser("validate")
     pv.add_argument("--target-key", required=False)
 
@@ -855,6 +1124,7 @@ COMMANDS = {
     "stamp-keys": cmd_stamp_keys,
     "copy-fields": cmd_copy_fields,
     "build": cmd_build,
+    "update-sprints": cmd_update_sprints,
     "validate": cmd_validate,
 }
 
