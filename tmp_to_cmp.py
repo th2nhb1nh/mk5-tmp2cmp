@@ -89,6 +89,7 @@ class Config:
     source_key: str
     target_key: str
     key_field_id: str
+    key_field_name: str
     output_dir: Path
     dry_run: bool = False
     create_target: bool = False
@@ -111,10 +112,11 @@ class Config:
         source_key = getattr(args, "source_key", "") or os.environ.get("JIRA_SOURCE_KEY", "")
         target_key = getattr(args, "target_key", "") or os.environ.get("JIRA_TARGET_KEY", "")
         key_field_id = getattr(args, "key_field", None) or os.environ.get("JIRA_KEY_FIELD", "customfield_25199")
+        key_field_name = getattr(args, "key_field_name", None) or os.environ.get("JIRA_KEY_FIELD_NAME", "")
         return cls(
             base_url=base, email=email, api_token=token,
             source_key=source_key, target_key=target_key,
-            key_field_id=key_field_id, output_dir=output_dir,
+            key_field_id=key_field_id, key_field_name=key_field_name, output_dir=output_dir,
             dry_run=getattr(args, "dry_run", False),
             create_target=getattr(args, "create_target", False),
             target_board_id=getattr(args, "target_board_id", None) or _to_int_or_none(os.environ.get("JIRA_TARGET_BOARD_ID")),
@@ -407,7 +409,60 @@ def extract_project_meta(client: JiraClient, key: str) -> Dict:
         "assigneeType": proj.get("assigneeType"),
     }
 
-def extract_issues_aggregate(client: JiraClient, key: str) -> Dict:
+def _scoped_jql(key: str, extra_jql: str = "") -> str:
+    """Build `project = "<key>"`, optionally AND-ed with an extra clause.
+
+    `validate` and `report` pass a migrated-issues clause (the stamped key field
+    IS NOT EMPTY) so their target-side measurements count only issues that came
+    from the source project — never the pre-existing issues that may already
+    live in an in-use target project.
+    """
+    base = f'project = "{key}"'
+    return f"{base} AND {extra_jql}" if extra_jql else base
+
+
+def _migrated_clause(key_field_jql: str) -> str:
+    """JQL clause that selects only migrated issues (those carrying a stamped
+    source key). `key_field_jql` is the JQL-safe reference to the key field —
+    its *name*, not its `customfield_x` id (see `resolve_key_field_jql`). Returns
+    "" when no reference is available, in which case the caller falls back to the
+    whole project.
+    """
+    return f'"{key_field_jql}" IS NOT EMPTY' if key_field_jql else ""
+
+
+def resolve_key_field_jql(client: JiraClient, cfg: Config) -> str:
+    """Resolve the JQL-safe reference for the stamped key field.
+
+    Jira's JQL matches a custom field by its *name* (or `cf[id]`), not by the
+    `customfield_x` id string — querying `"customfield_25199" IS NOT EMPTY`
+    raises "Field 'customfield_25199' does not exist". So we resolve a quotable
+    name, in order of preference:
+
+      1. `JIRA_KEY_FIELD_NAME` from the environment / `--key-field-name`. Set
+         this to the exact name shown in the field picker, including any
+         disambiguator such as `Original Work Item Key[Short text]`. Recommended,
+         because it is unambiguous.
+      2. The field's `name` looked up from the field catalog by its id.
+      3. The id itself, as a last resort (preserves prior behaviour rather than
+         silently dropping the filter).
+
+    The `fields=` parameter of the search endpoint and editIssue payloads still
+    use the `customfield_x` id — only the JQL WHERE clause needs the name.
+    """
+    if cfg.key_field_name:
+        return cfg.key_field_name
+    if cfg.key_field_id:
+        for f in client.all_fields():
+            if f.get("id") == cfg.key_field_id:
+                name = f.get("name")
+                if name:
+                    logging.debug("Resolved key field name for JQL: %s -> %s", cfg.key_field_id, name)
+                    return name
+    return cfg.key_field_id
+
+
+def extract_issues_aggregate(client: JiraClient, key: str, extra_jql: str = "") -> Dict:
     types = {}
     type_status_pairs = {}
     by_type = {}
@@ -415,7 +470,7 @@ def extract_issues_aggregate(client: JiraClient, key: str) -> Dict:
     by_resolution = {}
     total = 0
     fields = ["issuetype", "status", "resolution"]
-    for issue in client.search_jql(f'project = "{key}"', fields=fields):
+    for issue in client.search_jql(_scoped_jql(key, extra_jql), fields=fields):
         total += 1
         f = issue["fields"]
         it = f.get("issuetype")
@@ -463,8 +518,8 @@ def extract_sprints(client: JiraClient, board_id: int) -> List[Dict]:
              "startDate": s.get("startDate", ""), "endDate": s.get("endDate", ""),
              "goal": s.get("goal", "")} for s in raw]
 
-def extract_boolean_buckets(client: JiraClient, key: str) -> Dict[str, int]:
-    base = f'project = "{key}"'
+def extract_boolean_buckets(client: JiraClient, key: str, extra_jql: str = "") -> Dict[str, int]:
+    base = _scoped_jql(key, extra_jql)
     return {
         "withAttachments": client.approximate_count(f"{base} AND attachments is not EMPTY"),
         "withComments": client.approximate_count(f"{base} AND comment is not EMPTY"),
@@ -603,7 +658,7 @@ def stamp_test_first_issue(client: JiraClient, source_key: str, field_id: str, d
     client.put(f"/rest/api/3/issue/{issue_key}", body={"fields": {field_id: issue_key}}, params={"notifyUsers": "false"})
     check = client.get(f"/rest/api/3/issue/{issue_key}", params={"fields": field_id})
     if check.get("fields", {}).get(field_id) != issue_key:
-        raise SystemExit(f"Test stamp failed: field not editable on issue type.")
+        raise SystemExit("Test stamp failed: field not editable on issue type.")
     logging.info("Test stamp verified.")
     return issue_key
 
@@ -663,14 +718,16 @@ def cmd_copy_fields(cfg: Config) -> None:
     checkpoint = out / "copied.txt"
     done = set(checkpoint.read_text().splitlines()) if checkpoint.exists() else set()
 
-    total = client.approximate_count(f'project = "{cfg.target_key}" AND "{cfg.key_field_id}" IS NOT EMPTY')
+    key_field_jql = resolve_key_field_jql(client, cfg)
+    stamped_clause = _migrated_clause(key_field_jql)
+    total = client.approximate_count(f'project = "{cfg.target_key}" AND {stamped_clause}')
     logging.info("Approx %d target issues with stamped source key", total)
 
     failures = []
     processed = 0
     src_field_ids = [m["source_field_id"] for m in mappings]
     for issue in client.search_jql(
-        f'project = "{cfg.target_key}" AND "{cfg.key_field_id}" IS NOT EMPTY',
+        f'project = "{cfg.target_key}" AND {stamped_clause}',
         fields=[cfg.key_field_id],
     ):
         target_key = issue["key"]
@@ -871,8 +928,14 @@ def _plan_sprint_updates(
     sprint_field_id: str,
     sprint_map: Dict[str, str],
     done: set,
+    extra_jql: str = "",
 ) -> Dict[str, Any]:
     """Scan target project once; produce an execution plan.
+
+    `extra_jql` is AND-ed onto the scan — `update-sprints` passes the
+    migrated-issues clause so a reused target project's pre-existing issues
+    (which carry target-native sprint ids absent from `sprint_map`) are never
+    scanned, written, or listed as unmapped.
 
     Returns:
       {
@@ -903,7 +966,7 @@ def _plan_sprint_updates(
         "sprint_state": sprint_state,
     }
 
-    jql = f'project = "{target_key}" AND sprint is not EMPTY'
+    jql = _scoped_jql(target_key, f"sprint is not EMPTY AND {extra_jql}" if extra_jql else "sprint is not EMPTY")
     for issue in client.search_jql(jql, fields=[sprint_field_id]):
         key = issue["key"]
         if key in done:
@@ -1007,6 +1070,15 @@ def cmd_update_sprints(cfg: Config) -> None:
     sprint_field_id = client.sprint_field_id()
     logging.info("Using sprint field id: %s", sprint_field_id)
 
+    # Scope the scan to migrated issues only (stamped key field IS NOT EMPTY),
+    # so a reused target project's pre-existing issues are never written. Falls
+    # back to scanning all issues (with a warning) if no key field resolves, so
+    # the command keeps working on a clean target without the key field set.
+    migrated_clause = _migrated_clause(resolve_key_field_jql(client, cfg))
+    if not migrated_clause:
+        logging.warning("No key field configured — updating sprints on ALL target issues, "
+                        "including any pre-existing ones not part of the migration.")
+
     out = cfg.output_dir / "update_sprints"
     out.mkdir(parents=True, exist_ok=True)
     checkpoint = out / "updated.txt"
@@ -1014,7 +1086,8 @@ def cmd_update_sprints(cfg: Config) -> None:
 
     # ------ Plan ------
     logging.info("Planning sprint updates (scanning target project once)...")
-    plan = _plan_sprint_updates(client, cfg.target_key, sprint_field_id, sprint_map, done)
+    plan = _plan_sprint_updates(client, cfg.target_key, sprint_field_id, sprint_map, done,
+                                extra_jql=migrated_clause)
 
     n_total = len(plan["issues"])
     n_open = len(plan["open_issues"])
@@ -1195,6 +1268,7 @@ def _collect_sprint_csv_rows(
     target_key: str,
     sprint_field_id: str,
     sprint_map: Dict[str, str],
+    extra_jql: str = "",
 ) -> tuple[List[Dict[str, str]], List[tuple]]:
     """Scan the target project once and build the External Import rows.
 
@@ -1204,6 +1278,11 @@ def _collect_sprint_csv_rows(
     project, where the Sprint field still references the *source* sprint ids
     after a bulk-move.
 
+    `extra_jql` is AND-ed onto the scan — callers pass the migrated-issues clause
+    so a reused target project's pre-existing issues (which carry target-native
+    sprint ids that aren't keys in `sprint_map`) are never scanned, keeping them
+    out of both the import CSV and the `missing_map` noise.
+
     Returns (rows, missing_map):
       - rows: dicts keyed by SPRINT_CSV_HEADERS, target sprint ids joined by ","
       - missing_map: [(issue_key, [unmapped_source_sprint_id, ...]), ...]
@@ -1211,7 +1290,7 @@ def _collect_sprint_csv_rows(
     rows: List[Dict[str, str]] = []
     missing_map: List[tuple] = []
     fields = [sprint_field_id, "summary", "assignee", "project"]
-    jql = f'project = "{target_key}" AND sprint is not EMPTY'
+    jql = _scoped_jql(target_key, f"sprint is not EMPTY AND {extra_jql}" if extra_jql else "sprint is not EMPTY")
     for issue in client.search_jql(jql, fields=fields):
         f = issue["fields"]
         sprint_field = f.get(sprint_field_id)
@@ -1261,8 +1340,11 @@ def cmd_export_sprint_csv(cfg: Config) -> None:
     against Jira itself; the import is a manual UI step.
 
     Reads the same `build/sprint_id_mapping.csv` as `update-sprints`, scans the
-    target project for every issue that still has a sprint, maps source sprint
-    ids to target sprint ids, and writes one row per issue.
+    target project for every migrated issue that still has a sprint, maps source
+    sprint ids to target sprint ids, and writes one row per issue. Like
+    `validate`/`report`, the scan is scoped to migrated issues only (stamped key
+    field IS NOT EMPTY) so a reused target project's pre-existing issues are left
+    untouched.
     """
     client = JiraClient(cfg.base_url, cfg.email, cfg.api_token)
     preflight(client, target_key=cfg.target_key, target_must_exist=True)
@@ -1279,11 +1361,17 @@ def cmd_export_sprint_csv(cfg: Config) -> None:
     sprint_field_id = client.sprint_field_id()
     logging.info("Using sprint field id: %s", sprint_field_id)
 
+    migrated_clause = _migrated_clause(resolve_key_field_jql(client, cfg))
+    if not migrated_clause:
+        logging.warning("No key field configured — exporting sprints for ALL target issues, "
+                        "including any pre-existing ones not part of the migration.")
+
     out = cfg.output_dir / "export_sprint_csv"
     out.mkdir(parents=True, exist_ok=True)
 
-    logging.info("Scanning target project %s for issues with sprints...", cfg.target_key)
-    rows, missing_map = _collect_sprint_csv_rows(client, cfg.target_key, sprint_field_id, sprint_map)
+    logging.info("Scanning target project %s for migrated issues with sprints...", cfg.target_key)
+    rows, missing_map = _collect_sprint_csv_rows(client, cfg.target_key, sprint_field_id, sprint_map,
+                                                 extra_jql=migrated_clause)
 
     csv_path = out / "sprint_import.csv"
     write_csv(csv_path, rows, SPRINT_CSV_HEADERS, delimiter=SPRINT_CSV_DELIMITER)
@@ -1313,6 +1401,12 @@ def cmd_export_sprint_csv(cfg: Config) -> None:
 def cmd_validate(cfg: Config) -> None:
     """
     Compare source baseline (extracted earlier) with current target project state.
+
+    Target-side counts are scoped to *migrated* issues only — those carrying a
+    stamped source key in `cfg.key_field_id`. This keeps the comparison honest
+    when the target project was already in use before the consolidation: only
+    the issues that came from the source project are reconciled against the
+    baseline, never the target's pre-existing issues.
     """
     client = JiraClient(cfg.base_url, cfg.email, cfg.api_token)
     preflight(client, target_key=cfg.target_key, target_must_exist=True)
@@ -1325,9 +1419,15 @@ def cmd_validate(cfg: Config) -> None:
     out_dir = cfg.output_dir / "validate"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    logging.info("Scanning target project %s...", cfg.target_key)
-    agg = extract_issues_aggregate(client, cfg.target_key)
-    buckets = extract_boolean_buckets(client, cfg.target_key)
+    key_field_jql = resolve_key_field_jql(client, cfg)
+    migrated_clause = _migrated_clause(key_field_jql)
+    if migrated_clause:
+        logging.info("Scanning target project %s (migrated issues only: %s)...", cfg.target_key, migrated_clause)
+    else:
+        logging.warning("No key field configured — validating against ALL target issues, "
+                        "including any pre-existing ones not part of the migration.")
+    agg = extract_issues_aggregate(client, cfg.target_key, extra_jql=migrated_clause)
+    buckets = extract_boolean_buckets(client, cfg.target_key, extra_jql=migrated_clause)
 
     target_inv = {
         "projectKey": cfg.target_key,
@@ -1364,7 +1464,7 @@ def cmd_validate(cfg: Config) -> None:
         sprint_map = load_sprint_id_map(sprint_map_path)
         if sprint_map:
             logging.info("Validating sprint membership...")
-            mismatches = _validate_sprint_membership(client, cfg.source_key, cfg.target_key, sprint_map)
+            mismatches = _validate_sprint_membership(client, cfg.source_key, cfg.target_key, sprint_map, key_field_jql)
             if mismatches:
                 write_json(out_dir / "sprint_mismatches.json", mismatches)
                 logging.warning("Sprint membership mismatches found: %d sprints with count differences", len(mismatches))
@@ -1378,7 +1478,7 @@ def cmd_validate(cfg: Config) -> None:
     field_mapping_path = cfg.output_dir / "mapping" / "field_mapping.csv"
     if field_mapping_path.exists():
         logging.info("Validating custom field values (sampling up to 50 issues)...")
-        field_mismatches = _validate_field_values(client, cfg.key_field_id, field_mapping_path, cfg.target_key)
+        field_mismatches = _validate_field_values(client, cfg.key_field_id, field_mapping_path, cfg.target_key, key_field_jql)
         if field_mismatches:
             write_json(out_dir / "field_mismatches.json", field_mismatches)
             logging.warning("Field value mismatches found in sample. See field_mismatches.json")
@@ -1397,14 +1497,22 @@ def cmd_validate(cfg: Config) -> None:
 
 
 def _validate_sprint_membership(client: JiraClient, src_key: str, tgt_key: str,
-                                sprint_map: Dict[str, str]) -> List[Dict]:
-    """For each mapped sprint, compare source vs target issue counts."""
+                                sprint_map: Dict[str, str], key_field_jql: str = "") -> List[Dict]:
+    """For each mapped sprint, compare source vs target issue counts.
+
+    The target count is scoped to migrated issues (stamped key field IS NOT
+    EMPTY) so pre-existing target issues that happen to sit in a reused target
+    sprint don't inflate the count. `key_field_jql` is the JQL-safe field name
+    (see `resolve_key_field_jql`).
+    """
+    migrated_clause = _migrated_clause(key_field_jql)
+    tgt_filter = f" AND {migrated_clause}" if migrated_clause else ""
     mismatches = []
     for src_id, tgt_id in sprint_map.items():
         src_count = client.approximate_count(f'project = "{src_key}" AND sprint = {src_id}')
         if src_count == 0:
             continue
-        tgt_count = client.approximate_count(f'project = "{tgt_key}" AND sprint = {tgt_id}')
+        tgt_count = client.approximate_count(f'project = "{tgt_key}" AND sprint = {tgt_id}{tgt_filter}')
         if src_count != tgt_count:
             mismatches.append({
                 "source_sprint_id": src_id,
@@ -1417,13 +1525,19 @@ def _validate_sprint_membership(client: JiraClient, src_key: str, tgt_key: str,
 
 
 def _validate_field_values(client: JiraClient, key_field_id: str,
-                           mapping_csv: Path, tgt_key: str) -> List[Dict]:
-    """Sample target issues, fetch source via stamped key, compare mapped fields."""
+                           mapping_csv: Path, tgt_key: str, key_field_jql: str = "") -> List[Dict]:
+    """Sample target issues, fetch source via stamped key, compare mapped fields.
+
+    `key_field_id` (the `customfield_x` id) is used to request and read the
+    stamped value; `key_field_jql` (the field *name*) is used in the WHERE
+    clause, since JQL matches custom fields by name. Falls back to the id for
+    JQL only if no name was resolved.
+    """
     mappings = [(m["source_field_id"], m["target_field_id"]) for m in load_field_mappings(mapping_csv)]
     if not mappings:
         return []
 
-    sample_jql = f'project = "{tgt_key}" AND "{key_field_id}" IS NOT EMPTY'
+    sample_jql = f'project = "{tgt_key}" AND {_migrated_clause(key_field_jql or key_field_id)}'
     target_field_ids = [tgt for _, tgt in mappings]
     source_field_ids = [src for src, _ in mappings]
     mismatches = []
@@ -1482,6 +1596,15 @@ def cmd_doctor(cfg: Config) -> None:
         logging.info("Boards on target: %s", [(b["id"], b["name"]) for b in boards])
     if cfg.key_field_id:
         precheck_key_field(client, cfg.key_field_id)
+        key_field_jql = resolve_key_field_jql(client, cfg)
+        logging.info("Key field: id=%s | JQL name=%s", cfg.key_field_id, key_field_jql)
+        if key_field_jql == cfg.key_field_id:
+            logging.warning(
+                "Could not resolve a JQL name for %s. JQL filters by name, not id — "
+                "set JIRA_KEY_FIELD_NAME (e.g. 'Original Work Item Key[Short text]') "
+                "so validate/report/copy-fields can scope to migrated issues.",
+                cfg.key_field_id,
+            )
     try:
         logging.info("Sprint custom field id: %s", client.sprint_field_id())
     except SystemExit as e:
@@ -1600,7 +1723,6 @@ def _rpt_autosize(ws, min_width: int = 10, max_width: int = 60) -> None:
 def _build_report_workbook(cfg: Config, project_team_data: Dict[str, Any]) -> Path:
     """Assemble the workbook. All numeric totals/deltas use Excel formulas."""
     from openpyxl import Workbook
-    from openpyxl.utils import get_column_letter
     styles = _rpt_styles()
     wb = Workbook()
     # The default sheet will be repurposed as Summary
@@ -2116,6 +2238,10 @@ def _gather_report_data(client: JiraClient, cfg: Config) -> Dict[str, Any]:
        - update_sprints/ logs
        - validate/ outputs (optional, regenerated if missing)
        - live re-query for target inventory + sprint counts
+
+    All target-side measurements are scoped to migrated issues only (the stamped
+    key field IS NOT EMPTY), so a target project that was already in use before
+    the consolidation reports only on what was migrated into it.
     """
     ex = cfg.output_dir / "extract"
     bd = cfg.output_dir / "build"
@@ -2142,11 +2268,22 @@ def _gather_report_data(client: JiraClient, cfg: Config) -> Dict[str, Any]:
     sprint_mismatches = read_json(vd / "sprint_mismatches.json", default=[])
     target_inv = read_json(vd / "target_inventory.json", default={})
 
+    # Scope every target-side measurement to migrated issues only (stamped key
+    # field IS NOT EMPTY), so a target project that was already in use before the
+    # consolidation reports on the migrated issues alone, not its pre-existing
+    # ones. `target_inventory.json` from `validate` is already scoped this way.
+    # JQL matches the field by name, not id — resolve it once (see
+    # resolve_key_field_jql).
+    key_field_jql = resolve_key_field_jql(client, cfg)
+    migrated_clause = _migrated_clause(key_field_jql)
+    tgt_sprint_filter = f" AND {migrated_clause}" if migrated_clause else ""
+
     # Re-query target if validate hasn't been run (or to refresh)
     if not target_inv or not target_inv.get("total"):
-        logging.info("Validate output not found — scanning target project live for inventory...")
-        agg = extract_issues_aggregate(client, cfg.target_key)
-        buckets = extract_boolean_buckets(client, cfg.target_key)
+        logging.info("Validate output not found — scanning target project live for inventory%s...",
+                     " (migrated issues only)" if migrated_clause else "")
+        agg = extract_issues_aggregate(client, cfg.target_key, extra_jql=migrated_clause)
+        buckets = extract_boolean_buckets(client, cfg.target_key, extra_jql=migrated_clause)
         target_inv = {
             "projectKey": cfg.target_key,
             "total": agg["total"],
@@ -2184,7 +2321,7 @@ def _gather_report_data(client: JiraClient, cfg: Config) -> Dict[str, Any]:
                 src_counts[src_id] = 0
             try:
                 tgt_counts[tgt_id] = client.approximate_count(
-                    f'project = "{cfg.target_key}" AND sprint = {tgt_id}'
+                    f'project = "{cfg.target_key}" AND sprint = {tgt_id}{tgt_sprint_filter}'
                 )
             except Exception as e:
                 logging.warning("Could not count target sprint %s: %s", tgt_id, e)
@@ -2194,13 +2331,13 @@ def _gather_report_data(client: JiraClient, cfg: Config) -> Dict[str, Any]:
     # This sheet replaces the migration log as the single source of truth that
     # the project team can reference for "where did my ticket go?"
     issue_key_pairs: List[Dict[str, Any]] = []
-    if cfg.key_field_id:
+    if cfg.key_field_id and migrated_clause:
         expected = client.approximate_count(
-            f'project = "{cfg.target_key}" AND "{cfg.key_field_id}" IS NOT EMPTY'
+            f'project = "{cfg.target_key}" AND {migrated_clause}'
         )
         logging.info("Building full issue key map (~%d issues expected)...", expected)
         for issue in client.search_jql(
-            f'project = "{cfg.target_key}" AND "{cfg.key_field_id}" IS NOT EMPTY ORDER BY created ASC',
+            f'project = "{cfg.target_key}" AND {migrated_clause} ORDER BY created ASC',
             fields=[cfg.key_field_id, "summary", "status", "issuetype"],
         ):
             f = issue["fields"]
@@ -2302,6 +2439,7 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--source-key", help="or JIRA_SOURCE_KEY")
     pd.add_argument("--target-key", help="or JIRA_TARGET_KEY")
     pd.add_argument("--key-field", help="or JIRA_KEY_FIELD")
+    pd.add_argument("--key-field-name", help="or JIRA_KEY_FIELD_NAME (JQL name of the key field)")
 
     pe = sub.add_parser("extract")
     pe.add_argument("--source-key", required=False)
@@ -2315,6 +2453,7 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--source-key", required=False)
     pc.add_argument("--target-key", required=False)
     pc.add_argument("--key-field")
+    pc.add_argument("--key-field-name", help="or JIRA_KEY_FIELD_NAME (JQL name of the key field)")
     pc.add_argument("--dry-run", action="store_true")
 
     pb = sub.add_parser("build")
@@ -2335,11 +2474,13 @@ def build_parser() -> argparse.ArgumentParser:
     pv = sub.add_parser("validate")
     pv.add_argument("--target-key", required=False)
     pv.add_argument("--key-field")
+    pv.add_argument("--key-field-name", help="or JIRA_KEY_FIELD_NAME (JQL name of the key field)")
 
     pr = sub.add_parser("report", help="Generate post-migration Excel report for the project team.")
     pr.add_argument("--source-key", required=False)
     pr.add_argument("--target-key", required=False)
     pr.add_argument("--key-field")
+    pr.add_argument("--key-field-name", help="or JIRA_KEY_FIELD_NAME (JQL name of the key field)")
 
     return p
 
