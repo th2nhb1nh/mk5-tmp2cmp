@@ -1,15 +1,16 @@
 # Jira TMP → CMP Migration Toolkit
 
-A Python CLI that handles **Phase 3** of a team-managed → company-managed Jira
-project migration: pulling configuration off the source project, preserving
-each issue's original key in a custom field so post-move CSV imports can
-join on it, and rebuilding versions / components / sprints in the
-pre-built target project.
+A Python CLI that handles **Phase 3** of a team-managed (TMP) → company-managed
+(CMP) Jira project migration: pulling configuration off the source project,
+preserving each issue's original key in a custom field so post-move work can
+join on it, rebuilding versions / components / sprints in the target project,
+re-stitching sprint membership and field values after the bulk-move, validating
+the result, and generating a polished Excel report for the project team.
 
 It deliberately does **not** create schemes, workflows, screens, or global
 custom fields — those need human design decisions and are best done in the
-Jira UI. It also doesn't move issues; that's the bulk-move step you'll run
-in the UI during the cutover window.
+Jira UI. It also doesn't move the issues themselves; that's the native
+**bulk-move** step you run in the UI during the cutover window.
 
 ---
 
@@ -24,7 +25,11 @@ in the UI during the cutover window.
    - 5.1. [Run `extract`](#51-run-extract)
    - 5.2. [Run `stamp-keys`](#52-run-stamp-keys)
    - 5.3. [Build the target shell + run `build`](#53-build-the-target-shell--run-build)
-   - 5.4. [Run `validate` after bulk-move](#54-run-validate-after-bulk-move)
+   - 5.4. [Bulk-move in the UI](#54-bulk-move-in-the-ui)
+   - 5.5. [Run `update-sprints`](#55-run-update-sprints)
+   - 5.6. [Run `copy-fields`](#56-run-copy-fields)
+   - 5.7. [Run `validate`](#57-run-validate)
+   - 5.8. [Run `report`](#58-run-report)
 6. [Command reference](#6-command-reference)
 7. [Output artifacts](#7-output-artifacts)
 8. [Troubleshooting](#8-troubleshooting)
@@ -36,13 +41,19 @@ in the UI during the cutover window.
 
 | Phase | Subcommand | What it does |
 |---|---|---|
-| Preflight | `doctor` | Verifies your token works and you can see the project(s). Run this first, before anything else. |
-| Source extract | `extract` | One pass over all source issues, plus version/component/sprint/role/field extraction. Writes JSON + CSV. |
+| Preflight | `doctor` | Verifies your token works, you can see the project(s), lists boards, and resolves the Sprint custom field id. Run this first. No writes. |
+| Source extract | `extract` | One pass over all source issues, plus version / component / sprint / role extraction and a full field catalog (with allowed values) built from `/editmeta`. Writes JSON + CSV. |
 | Key preservation | `stamp-keys` | Writes each source issue's current key into a designated text custom field (`customfield_25199` by default) so the original key survives the bulk-move key change. |
-| Target rebuild | `build` | Recreates versions, components, and sprints in the pre-built target CMP. Outputs ID mapping CSVs to use in the bulk-move wizard. |
-| Post-move check | `validate` | Compares source baseline counts against target post-move counts. |
+| Target rebuild | `build` | Recreates versions, components, and sprints in the pre-built target CMP. Outputs ID-mapping CSVs used by the bulk-move wizard and by later phases. |
+| Sprint re-stitch | `update-sprints` | After bulk-move, rewrites the Sprint field on target issues from source sprint IDs to the new target sprint IDs (reopening/re-closing closed sprints as needed). |
+| Field re-stitch | `copy-fields` | After bulk-move, copies field values from each source issue to its target counterpart, joining on the stamped key and a `field_mapping.csv` you provide. |
+| Post-move check | `validate` | Compares source baseline counts against target post-move counts, plus optional sprint-membership and field-value sampling. |
+| Reporting | `report` | Generates a formatted multi-sheet Excel workbook (`migration_report.xlsx`) for the project team, including a full source-key → target-key map. |
 
-All phases are **idempotent**: re-running skips work already done (versions/components/sprints dedup by name; stamp-keys uses a checkpoint file).
+All write phases are **idempotent**: re-running skips work already done.
+Versions / components / sprints dedup by name; `stamp-keys`, `copy-fields`, and
+`update-sprints` each use a checkpoint file so an interrupted run resumes
+cleanly.
 
 ---
 
@@ -59,32 +70,31 @@ Check: `python3 --version`. If older, install a current Python.
 3. Treat it like a password. It expires after the period set on creation.
 
 The script authenticates as **the account that owns the token**. That account needs:
-- **Browse Projects** on the source TMP
-- **Browse Projects** + **Administer Project** on the target CMP (for version/component creation)
-- **Edit Issues** on the source TMP (for stamp-keys)
-- **Manage Sprints** on the target board (for sprint creation)
+- **Browse Projects** + **Edit Issues** on the source TMP (for extract / stamp-keys).
+- **Browse Projects** + **Administer Project** on the target CMP (for version/component creation and field edits).
+- **Manage Sprints** on the target board (for sprint creation and the reopen/close cycle in `update-sprints`).
 
 A site admin or org admin satisfies all of these by default. If you're using a non-admin token, verify each permission before running.
 
 ### 2.3 Source project setup (one-time, in the UI)
 
-Before running `stamp-keys`, the text field you'll use to preserve original keys (default: `customfield_25199`) must be on **every edit screen** of **every issue type** in the source TMP. Without this, the API will return 200 OK on the update but silently drop the value.
+Before running `stamp-keys`, the text field you'll use to preserve original keys (default: `customfield_25199`) must be on **every edit screen** of **every issue type** in the source TMP. Without this, the API returns 200 OK on the update but silently drops the value.
 
 In a TMP this means:
 1. Source TMP → **Project settings** → **Issue types**.
 2. For each issue type, drag the field onto the layout.
 3. Save.
 
-The script's `stamp-keys` command does a test-stamp-and-readback on the first issue and aborts with a clear error if the field isn't wired up — so you don't have to trust this manually.
+`stamp-keys` does a test-stamp-and-readback on the first issue and aborts with a clear error if the field isn't wired up — so you don't have to trust this manually.
 
 ### 2.4 Finding your IDs
 
 | What | Where to find it |
 |---|---|
 | **Project key** | The prefix in any issue key (e.g. `TMP-123` → key is `TMP`). Also in `Project settings → Details`. Case-sensitive in the API. |
-| **Board ID** | Open the board in the UI. URL is `/jira/software/projects/<KEY>/boards/<ID>` — the trailing number is the board ID. |
-| **Account ID** (for `--target-lead`) | URL of a user's profile: `/jira/people/<accountId>`. Or via API: `GET /rest/api/3/user/search?query=<email>`. |
-| **Custom field ID** | Site admin → **Issues** → **Custom fields**, hover the field, look at the URL fragment, or call `GET /rest/api/3/field` and grep by name. Always starts with `customfield_`. |
+| **Board ID** | Open the board in the UI. URL is `/jira/software/projects/<KEY>/boards/<ID>` (or `?rapidView=<ID>`) — the trailing number is the board ID. `doctor` also prints board IDs for both projects. |
+| **Account ID** (for `--target-lead`) | URL of a user's profile, or via API: `GET /rest/api/3/user/search?query=<email>`. |
+| **Custom field ID** | Site admin → **Issues** → **Custom fields**, or call `GET /rest/api/3/field` and grep by name. Always starts with `customfield_`. The `extract` step's field catalog (§7) lists every project-scoped field with its id. |
 
 ---
 
@@ -92,46 +102,62 @@ The script's `stamp-keys` command does a test-stamp-and-readback on the first is
 
 ```bash
 # Clone or copy the script directory, then:
-cd tmp_to_cmp
+cd mk5-tmp2cmp
 python3 -m venv .venv
 source .venv/bin/activate
-pip install requests
+pip install -r requirements.txt
 ```
 
-Tested on Python 3.10+. The only external dependency is `requests`.
+Tested on Python 3.10+. Dependencies (see `requirements.txt`):
+- `requests` — HTTP client.
+- `python-dotenv` — auto-loads `.env` (optional but recommended).
+- `openpyxl` — only needed for the `report` command's Excel output.
 
 ---
 
 ## 4. Configure credentials
 
-The script reads three environment variables:
-
-| Variable | Example | Notes |
-|---|---|---|
-| `JIRA_BASE_URL` | `https://opswat-sandbox-113.atlassian.net` | Site URL. No trailing slash. |
-| `JIRA_EMAIL` | `binh.pham@opswat.com` | Email of the account that owns the API token. |
-| `JIRA_API_TOKEN` | (long opaque string) | From id.atlassian.com (see §2.2). |
-
-Easiest: copy `.env.example` to `.env`, fill in values, then:
+The script reads its configuration from environment variables. If a `.env` file
+is present it is **loaded automatically on every run** (via `python-dotenv`) —
+you do **not** need to `source` it. Copy the template and fill it in:
 
 ```bash
-source .env
+cp .env.example .env
+# edit .env
 ```
 
-before running the script. The script will refuse to start if any of the three are missing.
+| Variable | Required? | Used by | Notes |
+|---|---|---|---|
+| `JIRA_BASE_URL` | Always | all | Site URL, no trailing slash. e.g. `https://your-site.atlassian.net` |
+| `JIRA_EMAIL` | Always | all | Email of the account that owns the API token. |
+| `JIRA_API_TOKEN` | Always | all | From id.atlassian.com (see §2.2). Token only — there is no `--token` flag. |
+| `JIRA_SOURCE_KEY` | Per command | extract, stamp-keys, copy-fields, report | Source TMP project key. |
+| `JIRA_TARGET_KEY` | Per command | build, update-sprints, copy-fields, validate, report | Target CMP project key. |
+| `JIRA_KEY_FIELD` | Optional | stamp-keys, copy-fields, validate, report | Text field for the preserved key. Default `customfield_25199`. |
+| `JIRA_OUTPUT_DIR` | Optional | all | Artifacts directory. Default `./out`. |
+| `JIRA_TARGET_BOARD_ID` | Optional | build | Target Scrum board id; required for sprint creation. |
+| `JIRA_TARGET_LEAD` | Optional | build | Lead accountId; required only with `--create-target`. |
+| `JIRA_TARGET_TEMPLATE` | Optional | build | Project template for `--create-target`. Defaults to Scrum (classic CMP). |
+
+Every variable except the three auth values can also be passed as a CLI flag
+(`--source-key`, `--target-key`, `--key-field`, `--output-dir`, etc.), which
+takes precedence over the environment. The script refuses to start if any of
+`JIRA_BASE_URL`, `JIRA_EMAIL`, or `JIRA_API_TOKEN` is missing.
 
 ---
 
 ## 5. Step-by-step workflow
 
-The four phases in order. Each section explains what to run, what to expect on screen, and what the command produces.
+The phases in order. Each section explains what to run, what to expect, and what
+the command produces. The bulk-move itself (§5.4) is a manual UI step that sits
+in the middle of the toolkit run.
 
 ### 5.0. Run `doctor` first
 
 **Purpose:** Confirm the script can authenticate and see both projects before you invest time running anything real.
 
 ```bash
-python tmp_to_cmp.py doctor \
+python3 tmp_to_cmp.py doctor \
     --source-key TMP \
     --target-key NEW \
     --key-field customfield_25199
@@ -139,135 +165,70 @@ python tmp_to_cmp.py doctor \
 
 `--target-key` and `--key-field` are optional. If you only have a source project so far, omit `--target-key`.
 
-**Expected output (success):**
+It authenticates, checks each project you pass, lists the boards on each (so you
+can grab the **target board ID** for `build`), validates that the key field is a
+text field, and resolves the Sprint custom field id (e.g. `customfield_10020`).
 
-```
-2026-05-21 09:00:01 INFO    ======================================================================
-2026-05-21 09:00:01 INFO    Preflight
-2026-05-21 09:00:01 INFO    ======================================================================
-2026-05-21 09:00:02 INFO    Authenticated OK
-2026-05-21 09:00:02 INFO      User:      Binh Pham
-2026-05-21 09:00:02 INFO      Email:     binh.pham@opswat.com
-2026-05-21 09:00:02 INFO      AccountId: 5b10a2844c20165700ede21g
-2026-05-21 09:00:02 INFO      Site:      https://opswat-sandbox-113.atlassian.net
-2026-05-21 09:00:02 INFO    Source project 'TMP' OK
-2026-05-21 09:00:02 INFO      Name:  My Team Managed Project
-2026-05-21 09:00:02 INFO      Style: next-gen
-2026-05-21 09:00:02 INFO      Type:  software
-2026-05-21 09:00:03 INFO    Target project 'NEW' OK
-2026-05-21 09:00:03 INFO      Name:  My Company Managed Project
-2026-05-21 09:00:03 INFO      Style: classic
-2026-05-21 09:00:03 INFO      Type:  software
-2026-05-21 09:00:03 INFO    ======================================================================
-2026-05-21 09:00:03 INFO    Boards on source 'TMP':
-2026-05-21 09:00:03 INFO      id=42  type=scrum   name=TMP board
-2026-05-21 09:00:04 INFO    Boards on target 'NEW':
-2026-05-21 09:00:04 INFO      id=99  type=scrum   name=NEW board
-2026-05-21 09:00:04 INFO    Key field OK: customfield_25199 = 'Original Issue Key' (type=string)
-2026-05-21 09:00:04 INFO    Doctor done. All checks above are green => safe to run extract.
-```
-
-**Note the board IDs** — you'll need the target board ID for the build step.
-
-If anything fails, the script prints a structured error with the likely cause and remediation. See [§8 Troubleshooting](#8-troubleshooting).
+If anything fails, the script logs a structured error with the likely cause. See [§8 Troubleshooting](#8-troubleshooting).
 
 ---
 
 ### 5.1. Run `extract`
 
-**Purpose:** Pull all the data you need to (a) understand what's in the source, (b) rebuild structural objects in the target, and (c) reconcile after bulk-move.
+**Purpose:** Pull everything you need to (a) understand the source, (b) rebuild structural objects in the target, (c) decide field mappings, and (d) reconcile after bulk-move.
 
 ```bash
-python tmp_to_cmp.py extract --source-key TMP --output-dir ./out
+python3 tmp_to_cmp.py extract --source-key TMP
+# ./out is the default output dir. To override, put --output-dir BEFORE the
+# subcommand (it's a global option): python3 tmp_to_cmp.py --output-dir ./out extract --source-key TMPi
 ```
 
 **What it does, in order:**
 
 1. Pulls project metadata (name, lead, style).
-2. Single pass over every issue, collecting:
-   - Distinct issue types used.
-   - Distinct (issue type, status) pairs.
-   - Counts by type, status, and resolution.
-3. Pulls all versions, components, the board, all sprints (closed + active + future), board config, project roles + members.
-4. Samples 500 issues with `fields=*all` to catalog every custom field that has data.
-5. Runs five JQL approximate-count queries for boolean buckets (with attachments, with comments, with fix version, with components, with sprint).
-6. Writes everything to `./out/extract/` as JSON and CSV.
+2. Single pass over every issue, collecting distinct issue types, distinct (issue type, status) pairs, and counts by type, status, and resolution.
+3. Pulls all versions, components, the board, all sprints (closed + active + future), board config, and project roles.
+4. Runs five JQL approximate-count queries for boolean buckets (with attachments, comments, fixVersion, components, sprint) into the baseline.
+5. Builds a **full field catalog**: every project-scoped field, with allowed values pulled from `/rest/api/3/issue/{key}/editmeta` on a sample issue per type.
+6. Writes everything to `./out/extract/` as JSON (and CSV for the field catalog).
 
-**Expected output (key lines):**
+The field catalog (`12_source_field_catalog.csv`) is what you use to author the `field_mapping.csv` that `copy-fields` consumes.
 
-```
-EXTRACT: source=TMP output=/.../out/extract
-Wrote /.../out/extract/01_project_meta.json
-Scanning all issues (single pass)...
-  scanned 500 issues...
-  scanned 1000 issues...
-Wrote /.../out/extract/02_issue_types.json
-...
-Sampling custom fields in use...
-Wrote /.../out/extract/11_inventory_baseline.json
-EXTRACT complete. 1247 issues scanned. Artifacts in /.../out/extract
-```
-
-**Inspect the output:** `cat ./out/extract/11_inventory_baseline.json` to see the numbers you'll be reconciling against later. Save this file — `validate` reads it.
-
-**Re-running** overwrites the artifacts safely.
+**Inspect the output:** `cat ./out/extract/11_inventory_baseline.json` to see the numbers `validate` reconciles against later. Re-running overwrites the artifacts safely.
 
 ---
 
 ### 5.2. Run `stamp-keys`
 
-**Purpose:** Bulk-move generates new issue keys in the target project. To survive that, every source issue gets its current key written into a text custom field. After the move, you can join old-key → new-key by that field for CSV imports, audit trails, dashboards.
+**Purpose:** Bulk-move generates new issue keys in the target project. To survive that, every source issue gets its current key written into a text custom field. After the move you can join old-key → new-key by that field for field copies, audit trails, dashboards.
 
-**Prerequisite check:** `customfield_25199` (or whatever field you specified) must be on the edit screen of every source TMP issue type (see [§2.3](#23-source-project-setup-one-time-in-the-ui)).
+**Prerequisite check:** the key field must be on the edit screen of every source TMP issue type (see [§2.3](#23-source-project-setup-one-time-in-the-ui)).
 
 Start with dry-run:
 
 ```bash
-python tmp_to_cmp.py stamp-keys \
-    --source-key TMP \
-    --key-field customfield_25199 \
-    --dry-run
+python3 tmp_to_cmp.py stamp-keys --source-key TMP --key-field customfield_25199 --dry-run
 ```
 
 Then for real:
 
 ```bash
-python tmp_to_cmp.py stamp-keys \
-    --source-key TMP \
-    --key-field customfield_25199
+python3 tmp_to_cmp.py stamp-keys --source-key TMP --key-field customfield_25199
 ```
 
 **What it does:**
 
-1. Verifies the field exists and has `schema.type=string`.
+1. Verifies the field exists and has a text (`string`/`any`) schema type.
 2. Test-stamps the oldest issue and reads it back. **Aborts with a clear error if the value didn't persist.**
 3. Asks you to confirm before running on the rest.
-4. Walks every issue with paginated JQL search. For each one calls
-   `PUT /rest/api/3/issue/{KEY}?notifyUsers=false`
-   with body `{"fields": {"customfield_25199": "<KEY>"}}`.
-5. Writes each successfully stamped key to a checkpoint file as it goes.
-6. Sleeps 100 ms between writes to stay under Cloud rate limits.
+4. Walks every issue with paginated JQL, writing the key via `PUT /rest/api/3/issue/{KEY}?notifyUsers=false`.
+5. Appends each successfully stamped key to `./out/stamp/stamped.txt` as it goes, sleeping 100 ms between writes.
 
-**Expected output (key lines):**
+**Interrupt and resume:** Ctrl-C is safe. Re-run the same command; it reads the checkpoint and skips already-stamped keys.
 
-```
-STAMP-KEYS: TMP -> customfield_25199
-Key field OK: customfield_25199 = 'Original Issue Key' (type=string)
-Test stamp on TMP-1
-Test stamp verified.
-Approximate total issues: 1247
-About to stamp customfield_25199 on ~1247 issues in TMP. Continue? [y/N]: y
-Stamped 100 / ~1247 ...
-Stamped 200 / ~1247 ...
-...
-STAMP-KEYS complete. Processed 1247 issues this run.
-```
+**Failures:** any keys that fail land in `./out/stamp/failures.csv` with the error. Investigate and re-run; only un-checkpointed keys retry.
 
-**Notification noise:** the `notifyUsers=false` parameter on the PUT suppresses email for the field update. **Important**: source TMP **automation rules** listening on "Issue Updated" can still fire and generate notifications. Disable source automation rules before running.
-
-**Interrupt and resume:** Ctrl-C is safe. Re-run the same command; the script reads the checkpoint and skips already-stamped keys.
-
-**Failures:** any keys that fail land in `./out/stamp/stamp_failures.csv` with the error. Investigate and re-run; only failed keys retry.
+**Notification noise:** `notifyUsers=false` suppresses email for the field update itself, but source TMP **automation rules** listening on "Issue Updated" can still fire. **Disable source automation before running.**
 
 ---
 
@@ -277,71 +238,46 @@ This step has **manual UI work first**, then the script.
 
 #### 5.3.1 Manual: create the target CMP in the UI
 
-Why not script it? Project creation via API gives you no real control over scheme assignment, and you almost always want to assign existing standard schemes rather than the defaults Atlassian picks. Doing it in the UI gives you the scheme dialogs.
-
-In the Jira UI:
+Project creation via API gives no real control over scheme assignment, and you almost always want to assign existing standard schemes. Doing it in the UI gives you the scheme dialogs.
 
 1. **Create project** → Company-managed → Software (Scrum/Kanban as appropriate).
-2. **Project key**: pick a temporary key like `NEW` for now. You'll rename it to the original `TMP` key after bulk-move, once the source has been renamed to `TMP_OLD`.
-3. **Project settings → Schemes** — assign:
-   - Workflow scheme: standard one matching the source's intent, or your org default.
-   - Screen scheme & Issue type screen scheme: ones that expose all migrated fields on create/view/edit.
-   - Field configuration scheme.
-   - Permission scheme.
-   - **Notification scheme: a dedicated empty "Silent Migration" scheme** for the duration of cutover (more in the migration playbook).
-   - Issue security scheme: only if needed.
-4. Add `customfield_25199` and any other global custom fields you'll need to the appropriate field configurations and screens.
+2. **Project key**: pick a temporary key like `NEW`. You'll rename it to the original `TMP` key after bulk-move, once the source has been renamed (e.g. to `TMP_OLD`).
+3. **Project settings → Schemes** — assign workflow, screen, field configuration, permission, and notification schemes (a dedicated empty "Silent Migration" notification scheme is recommended for the cutover window).
+4. Add `customfield_25199` and any other global custom fields you'll map to the appropriate field configurations and screens.
 5. Create a Scrum **board** on the target. Note its board ID (see §2.4).
 
 #### 5.3.2 Run the build script
 
 ```bash
-python tmp_to_cmp.py build \
-    --target-key NEW \
-    --target-board-id 99 \
-    --dry-run
+python3 tmp_to_cmp.py build --target-key NEW --target-board-id 99 --dry-run
 ```
 
-After the dry-run looks clean:
+After the dry-run looks clean, drop `--dry-run`:
 
 ```bash
-python tmp_to_cmp.py build \
-    --target-key NEW \
-    --target-board-id 99
+python3 tmp_to_cmp.py build --target-key NEW --target-board-id 99
 ```
 
 **What it does, in order:**
 
 1. Confirms the target project exists and is accessible.
-2. Reads source extract artifacts.
-3. **Versions** — for each source version, if a version with the same name already exists in target, records the mapping and skips. Otherwise creates it via `POST /rest/api/3/version` with start/release dates, then patches `released`/`archived` flags. Writes `version_id_mapping.csv`.
-4. **Components** — same dedup-by-name pattern. Creates via `POST /rest/api/3/component` with lead and assignee type. Writes `component_id_mapping.csv`.
-5. **Sprints** — needs `--target-board-id`. For each source sprint, creates a sprint on the target board with matching name, start/end dates, and goal. If the source sprint was active or closed, transitions the new sprint through `active` (and `closed`) to match. Writes `sprint_id_mapping.csv`.
+2. Reads the source extract artifacts.
+3. **Versions** — dedup by name; otherwise create via `POST /rest/api/3/version` with dates, then patch `released`/`archived`. Writes `version_id_mapping.csv`.
+4. **Components** — same dedup-by-name pattern via `POST /rest/api/3/component`. Writes `component_id_mapping.csv`.
+5. **Sprints** — needs `--target-board-id`. Creates each source sprint on the target board with matching name, dates, and goal, then transitions it through `active` (and `closed`) to match the source state. Writes `sprint_id_mapping.csv`.
 
-**Expected output (key lines):**
+**The three mapping CSVs are inputs** to the bulk-move wizard (Fix Version / Component / Sprint mapping screens) and to the later `update-sprints` / `report` phases.
 
-```
-BUILD: target=NEW
-Wrote /.../out/build/version_id_mapping.csv (12 rows)
-Wrote /.../out/build/component_id_mapping.csv (4 rows)
-Wrote /.../out/build/sprint_id_mapping.csv (23 rows)
-BUILD complete. Mappings in /.../out/build
-```
-
-**The three mapping CSVs are inputs** to:
-- The bulk-move wizard (Fix Version / Component / Sprint field mapping screens).
-- Your post-move CSV imports for any data you're re-stitching by old field IDs.
-
-**Sprint closed-date caveat:** the Agile API sets `completeDate` to the moment you close a sprint via script — there's no way to backdate it. Closed sprints recreated by this script will show the recreation time. The script flags every closed sprint in `sprint_id_mapping.csv` with a `note` column saying so.
+**Sprint closed-date caveat:** the Agile API sets `completeDate` to the moment you close a sprint via script — it cannot be backdated. Closed sprints recreated here show the recreation time.
 
 **Re-running** is safe: existing versions/components/sprints (by name) are detected and skipped.
 
 #### 5.3.3 (Optional) Have the script create the target project
 
-If for some reason you can't create the target in the UI, the script can do it — but you'll need to re-assign schemes manually afterward anyway. Pass:
+If you can't create the target in the UI, the script can — but you'll still re-assign schemes manually afterward:
 
 ```bash
-python tmp_to_cmp.py build \
+python3 tmp_to_cmp.py build \
     --target-key NEW \
     --create-target \
     --target-lead 5b10a2844c20165700ede21g \
@@ -353,73 +289,154 @@ python tmp_to_cmp.py build \
 
 ---
 
-### 5.4. Run `validate` after bulk-move
+### 5.4. Bulk-move in the UI
 
-After you've performed the bulk-move in the UI during the cutover window and renamed the project keys (source → `TMP_OLD`, target → `TMP`), run:
+This is **not** a script step. During the cutover window:
+
+1. In the source TMP, select all issues and use Jira's native **bulk-move** to move them into the target CMP.
+2. On the wizard's mapping screens, use the `version_id_mapping.csv`, `component_id_mapping.csv`, and `sprint_id_mapping.csv` from `build` to map fields correctly.
+3. After the move, rename the projects: source → `TMP_OLD`, target → `TMP` (so the target inherits the original key).
+
+The bulk-move carries issue history, comments, attachments, and worklogs. It does **not** preserve TMP-scoped custom field values or the original sprint membership in a usable form — that's what `update-sprints` and `copy-fields` repair next.
+
+---
+
+### 5.5. Run `update-sprints`
+
+**Purpose:** After bulk-move, target issues may still reference the *source* sprint IDs (or lose sprint membership). This command rewrites the Sprint field on every target issue from source sprint IDs to the corresponding target sprint IDs, using `build/sprint_id_mapping.csv`.
 
 ```bash
-python tmp_to_cmp.py validate --target-key TMP
+python3 tmp_to_cmp.py update-sprints --target-key TMP --dry-run
+python3 tmp_to_cmp.py update-sprints --target-key TMP
+```
+
+**Execution model:**
+
+1. **Plan** — scan the target once, grouping issues by whether their target sprint set includes any *closed* sprints.
+2. **Phase A** — issues whose target sprints are all non-closed are updated directly.
+3. **Phase B** — for each closed target sprint with pending issues: reopen → update its issues → re-close. Only one closed sprint is reopened at a time (Jira disallows more than one active sprint unless parallel sprints are enabled on the board).
+
+**Caveats** (logged and written to CSV):
+- Re-closing a sprint stamps a new `completeDate` of *now*; the original is unrecoverable.
+- Issues spanning **more than one** closed sprint are skipped and listed in `multi_closed_issues.csv` for manual handling.
+- Issues referencing a source sprint with no target mapping are listed in `missing_sprint_map.csv`.
+
+**Resume:** checkpointed in `./out/update_sprints/updated.txt`. Per-sprint cycle outcomes go to `sprint_cycle_log.csv`; failures to `failures.csv`.
+
+---
+
+### 5.6. Run `copy-fields`
+
+**Purpose:** Copy custom-field values that didn't survive the bulk-move from each source issue to its target counterpart, joining on the stamped key.
+
+**Prerequisite:** author a mapping CSV at `./out/mapping/field_mapping.csv` with columns:
+
+```
+source_field_id,target_field_id,transform
+customfield_10050,customfield_22001,copy
+customfield_10051,customfield_22002,append_suffix
+```
+
+- `transform` is optional per row. Supported values: `copy` (default), `append_prefix` (writes `Original: <value>`), `append_suffix` (writes `<value> (migrated)`).
+- Use the `extract` field catalog (`12_source_field_catalog.csv`) to find source field ids.
+
+```bash
+python3 tmp_to_cmp.py copy-fields --source-key TMP_OLD --target-key TMP --dry-run
+python3 tmp_to_cmp.py copy-fields --source-key TMP_OLD --target-key TMP
+```
+
+**What it does:** finds every target issue with a stamped source key, fetches the mapped fields from the source issue, applies any transform, and writes them to the target via `PUT`. Checkpointed in `./out/copy_fields/copied.txt`; failures in `failures.csv`.
+
+---
+
+### 5.7. Run `validate`
+
+After bulk-move (and the re-stitch steps), reconcile against the baseline:
+
+```bash
+python3 tmp_to_cmp.py validate --target-key TMP --key-field customfield_25199
 ```
 
 **What it does:**
 
 1. Loads the baseline from `./out/extract/11_inventory_baseline.json`.
 2. Scans the target project with the same logic used in extract.
-3. Computes per-category diffs and writes:
-   - `./out/validate/target_inventory.json`
-   - `./out/validate/validation_delta.json` — full diff per type / status / resolution / bucket.
-   - `./out/validate/validation_summary.csv` — flat CSV for quick eyeball.
+3. Computes per-category diffs and writes `target_inventory.json`, `validation_delta.json`, and `validation_summary.csv`.
+4. If `build/sprint_id_mapping.csv` exists, compares per-sprint issue counts source-vs-target and writes `sprint_mismatches.json` on any mismatch.
+5. If `mapping/field_mapping.csv` exists, samples up to 50 target issues and compares mapped field values against source, writing `field_mismatches.json` on any mismatch.
 
-**Expected output:**
+If aggregate diffs are non-zero the script logs which buckets are off; open `validation_delta.json` to see by how much before declaring success.
 
-```
-Scanning target project for current counts...
-Wrote /.../out/validate/target_inventory.json
-Wrote /.../out/validate/validation_delta.json
-Validation: all top-level counts match.
-VALIDATE complete.
-```
+---
 
-If diffs are non-zero:
+### 5.8. Run `report`
 
-```
-Validation DIFFS found: total, withSprint
+**Purpose:** Produce a polished, multi-sheet Excel workbook for the project team summarizing the whole migration.
+
+```bash
+python3 tmp_to_cmp.py report --source-key TMP_OLD --target-key TMP --key-field customfield_25199
 ```
 
-Open `validation_delta.json` to see which buckets are off and by how much. Investigate before declaring success.
+Both `--source-key` and `--target-key` are required. It reads from `extract/`,
+`build/`, `update_sprints/`, and (optionally) `validate/`, then re-queries the
+target live for current inventory, per-sprint counts, and a full key map. The
+output is `./out/report/migration_report.xlsx` with sheets:
+
+- **Summary** — headline KPIs with OK/REVIEW/ATTENTION status, sprint cycle outcomes, and callouts.
+- **Issue Counts** — source vs target by type / status / resolution (live Excel formulas).
+- **Sprints** — per-sprint reconciliation with deltas.
+- **Versions** / **Components** — present/missing checks.
+- **Content Buckets** — attachment/comment/version/component/sprint coverage %.
+- **Issue Key Map** — every migrated issue: source key → clickable target key, type, status, summary.
+- **Exceptions** — unmapped sprints, multi-closed issues, update/copy failures, membership mismatches.
+- **Methodology** — plain-language notes on caveats (including the sprint `completeDate` behavior).
+
+Requires `openpyxl` (installed via `requirements.txt`).
 
 ---
 
 ## 6. Command reference
 
 ```
-python tmp_to_cmp.py [--base-url URL] [--email EMAIL] [--output-dir DIR] [--verbose] <subcommand> [opts]
+python3 tmp_to_cmp.py [--base-url URL] [--email EMAIL] [--output-dir DIR] [--verbose] <subcommand> [opts]
 
 Global options:
   --base-url    Jira site URL (or set JIRA_BASE_URL).
   --email       Account email (or set JIRA_EMAIL).
-  --output-dir  Artifacts directory. Default: ./out
+  --output-dir  Artifacts directory. Default: ./out (or JIRA_OUTPUT_DIR).
   --verbose     Debug logging.
 
 Subcommands:
 
   doctor [--source-key X] [--target-key Y] [--key-field customfield_25199]
-      Auth + project access check. No writes.
+      Auth + project access check, board listing, sprint-field resolution. No writes.
 
   extract --source-key X
-      Extract source project to ./out/extract/.
+      Extract source project + full field catalog to ./out/extract/.
 
   stamp-keys --source-key X [--key-field customfield_25199] [--dry-run]
       Write each source issue's key into the text custom field.
-      Idempotent via checkpoint file ./out/stamp/stamped.txt.
+      Idempotent via ./out/stamp/stamped.txt.
 
   build --target-key Y [--target-board-id N]
         [--create-target --target-lead ACCOUNT_ID]
         [--target-template TEMPLATE_KEY] [--dry-run]
-      Recreate versions, components, sprints in target.
+      Recreate versions, components, sprints in target. Writes mapping CSVs.
 
-  validate --target-key Y
-      Compare baseline (from extract) against current target.
+  update-sprints --target-key Y [--dry-run]
+      Rewrite the Sprint field on target issues from source to target sprint IDs,
+      reopening/re-closing closed sprints as needed. Needs build/sprint_id_mapping.csv.
+
+  copy-fields --source-key X --target-key Y [--key-field customfield_25199] [--dry-run]
+      Copy mapped field values from source to target, joining on the stamped key.
+      Needs ./out/mapping/field_mapping.csv.
+
+  validate --target-key Y [--key-field customfield_25199]
+      Compare baseline (from extract) against current target; optional sprint
+      and field-value checks.
+
+  report --source-key X --target-key Y [--key-field customfield_25199]
+      Generate ./out/report/migration_report.xlsx for the project team.
 ```
 
 ---
@@ -433,98 +450,101 @@ out/
 ├── migration.log                          # Append-only log of every run
 ├── extract/
 │   ├── 01_project_meta.json
-│   ├── 02_issue_types.{json,csv}
-│   ├── 03_statuses.{json,csv}
-│   ├── 04_versions.{json,csv}
-│   ├── 05_components.{json,csv}
+│   ├── 02_issue_types.json
+│   ├── 03_statuses.json
+│   ├── 04_versions.json
+│   ├── 05_components.json
 │   ├── 06_source_board.json
-│   ├── 07_sprints.{json,csv}
+│   ├── 07_sprints.json
 │   ├── 08_source_board_config.json
 │   ├── 09_roles.json
-│   ├── 10_custom_fields_in_use.{json,csv}
-│   └── 11_inventory_baseline.json
+│   ├── 11_inventory_baseline.json
+│   ├── 12_source_field_catalog.json
+│   └── 12_source_field_catalog.csv        # Use this to author field_mapping.csv
 ├── stamp/
 │   ├── stamped.txt                        # Checkpoint: one issue key per line
-│   └── stamp_failures.csv                 # If any
+│   └── failures.csv                       # If any
 ├── build/
 │   ├── version_id_mapping.csv
 │   ├── component_id_mapping.csv
 │   └── sprint_id_mapping.csv
-└── validate/
-    ├── target_inventory.json
-    ├── validation_delta.json
-    └── validation_summary.csv
+├── mapping/
+│   └── field_mapping.csv                  # You create this (input to copy-fields)
+├── update_sprints/
+│   ├── updated.txt                        # Checkpoint
+│   ├── missing_sprint_map.csv             # If any
+│   ├── multi_closed_issues.csv            # If any (manual follow-up)
+│   ├── sprint_cycle_log.csv               # Reopen/close outcomes per closed sprint
+│   └── failures.csv                       # If any
+├── copy_fields/
+│   ├── copied.txt                         # Checkpoint
+│   └── failures.csv                       # If any
+├── validate/
+│   ├── target_inventory.json
+│   ├── validation_delta.json
+│   ├── validation_summary.csv
+│   ├── sprint_mismatches.json             # If sprint mapping present and mismatched
+│   └── field_mismatches.json              # If field mapping present and mismatched
+└── report/
+    └── migration_report.xlsx
 ```
 
 ---
 
 ## 8. Troubleshooting
 
-### `AUTHENTICATION FAILED (401)`
-
-The 401 means the token+email pair was rejected. Things to check, in order:
+### `Authentication failed` (401)
 
 1. **Token validity.** Tokens expire. Generate a fresh one at https://id.atlassian.com/manage-profile/security/api-tokens.
-2. **Email matches token owner.** The `JIRA_EMAIL` env var must be the exact email of the account that created the token.
-3. **Base URL is correct.** Tokens are scoped to an organization, not a site. But the email account needs access to the specific `JIRA_BASE_URL` site. If you're using a sandbox, ensure your account has been provisioned there.
-4. **Manual sanity check** — the script's error message gives you a `curl` command. Run it. If that 401s, the script will 401.
+2. **Email matches token owner.** `JIRA_EMAIL` must be the exact email of the account that created the token.
+3. **Base URL / site access.** The account must have access to the specific `JIRA_BASE_URL` site. For a sandbox, ensure your account is provisioned there.
 
-### `SOURCE PROJECT 'XYZ' NOT ACCESSIBLE` (e.g. the MK5 case)
+### Source/target project not accessible
 
-The script disambiguates this for you:
+- **Key case mismatch** → use the exact key the API reports (keys are case-sensitive).
+- **Project exists but no BROWSE permission** → the token owner can't see it; add them to a project role or use a different token.
+- **Wrong site** → browse to the project in the UI and confirm the key and site match `JIRA_BASE_URL`.
 
-- **"Project key case mismatch"** → typo. Use the exact key the API reports.
-- **"Project EXISTS but the authenticated user lacks BROWSE permission"** → the token owner can't see the project. Either add them to a project role, or use a different token.
-- **"No project with key 'X' is visible. Sample of accessible keys: A, B, C"** → either the key is wrong, or you're authenticated to the wrong site. Browse to the project in the UI manually and check the key.
+### `Test stamp failed: field not editable on issue type.`
 
-### `Test stamp did not persist on TMP-1`
+The key field is not on the edit screen for that issue type in the source TMP. Add it to the layout for **every** issue type (see §2.3), save, and re-run.
 
-`customfield_25199` is not on the edit screen for that issue type in the source TMP. Go to the source project's settings → Issue types, drag the field onto the layout for every issue type, save, re-run.
+### `Key field customfield_X must be a text field (type string/any).`
 
-### `Field customfield_25199 has schema.type='option'. Must be a text (string) field.`
+You picked a non-text field. The stamping target must be a single-line text field. Create one if needed and re-run with the correct `--key-field`.
 
-You picked a non-text field by mistake. The stamping target needs to be a single-line text field. Create one if needed, then re-run with `--key-field <correct id>`.
+### `Could not resolve Sprint custom field id`
+
+The Sprint field is resolved at runtime from `/rest/api/3/field` by its schema key. This error means Jira Software (Agile) isn't enabled on the instance, or the token can't see agile fields. `update-sprints` and sprint-related steps need it.
 
 ### `429 Too Many Requests`
 
-The script already retries with exponential backoff. If sustained, increase `SLEEP_BETWEEN_WRITES` at the top of the script.
+The client already retries with exponential backoff. If sustained, increase `SLEEP_BETWEEN_WRITES` at the top of `tmp_to_cmp.py`.
 
-### `POST /rest/api/3/search/jql -> 400: Invalid request payload`
+### `POST /rest/api/3/search/jql -> 400`
 
-The new search endpoint validates the body strictly. Common payload mistakes:
+The new search endpoint validates strictly: it returns **no field data unless `fields` is set in the body**, rejects `startAt` (pagination is `nextPageToken`-based), and rejects a `null` first-page token. The toolkit handles all of these; the error log includes the full request body so you can see exactly what was sent.
 
-- `expand` sent as a JSON array. Must be a **comma-separated string**: `"names,schema"`, not `["names","schema"]`. The script handles this for you and will coerce lists to strings, but if you're hitting this from a custom call, check that.
-- `startAt` sent. The new endpoint rejects it — pagination is `nextPageToken`-based. The script never sends `startAt`.
-- `nextPageToken: null` on the first request. Atlassian's docs say the first page has token `null`, but actually passing `null` errors with "The provided next page token is invalid or expired." The script omits the field entirely on the first request.
+### Sprint reopen fails with an active-sprint conflict
 
-Since v1.1 the error log includes the full request body so you can see exactly what was sent:
+A board can have only one active sprint unless **parallel sprints** are enabled. `update-sprints` reopens one closed sprint at a time, but if another sprint is already active the reopen fails — enable parallel sprints on the target board and re-run.
 
-```
-ERROR POST .../search/jql -> 400 body={"jql":"project = \"MK5\"","fields":["*all"],"maxResults":100,"fieldsByKeys":false,"expand":"names"}: {"errorMessages":["Invalid request payload..."]}
-```
+### `Baseline not found. Run 'extract' first.` / `Sprint mapping not found. Run 'build' first.`
 
-If your payload looks right and the call still 400s, the JQL itself may be unbounded or reference an inaccessible field — try the same JQL in the UI's issue navigator first.
-
-### A redirected URL appears in error logs
-
-E.g. log shows `/rest/api/2/project/X` even though the script uses `/rest/api/3/`. Atlassian transparently redirects v3 to v2 for some endpoints. The script logs the original v3 URL it requested plus the redirect target so you can see what's happening. The behavior is correct — the 404 (or whatever code) applies to the redirected URL just as it would to the original.
-
-### `Baseline inventory not found. Run 'extract' first.`
-
-`validate` reads `./out/extract/11_inventory_baseline.json`. If you ran `extract` with a different `--output-dir`, point `validate` at the same one (it's a global option, comes before the subcommand).
+`validate`/`report` read `extract/11_inventory_baseline.json`; `update-sprints` reads `build/sprint_id_mapping.csv`. If you used a non-default `--output-dir`, point every command at the same one (it's a global option, before the subcommand).
 
 ---
 
 ## 9. Known limitations
 
-1. **Sprint `completeDate` cannot be backdated.** The Agile API stamps it at the moment of close. Closed sprints created by `build` will show the run time, not the original close time. Velocity charts in the target will reflect this. The mapping CSV flags affected sprints.
+1. **Sprint `completeDate` cannot be backdated.** The Agile API stamps it at the moment of close. Closed sprints created by `build`, and closed sprints re-closed by `update-sprints`, show the run time rather than the original close time. The reports flag affected sprints; historical Velocity may need recomputing.
 
-2. **TMP-scoped custom field IDs are not portable.** The `extract` step lists every custom field with data so you know what to map. The post-move CSV-import step (your plan) handles the actual data re-stitching using `customfield_25199` as the join key.
+2. **TMP-scoped custom field IDs are not portable.** `extract` catalogs every project-scoped field so you can author `field_mapping.csv`; `copy-fields` does the actual re-stitching, joining on the stamped key.
 
-3. **Board configuration is exported to JSON for reference only.** Columns, swimlanes, quick filters, card layout — all manual rebuild. This is usually a good opportunity to clean these up rather than copy them blindly.
+3. **Board configuration is exported to JSON for reference only.** Columns, swimlanes, quick filters, card layout — all manual rebuild. Usually a good chance to clean these up rather than copy blindly.
 
-4. **`completeDate` on issues** (sprint close-out timestamps, etc.) is not preserved when bulk-moving across projects. This is a Jira limitation, not the script's.
+4. **Issues spanning multiple closed sprints are skipped by `update-sprints`** unless parallel sprints are enabled on the target board. They're listed in `multi_closed_issues.csv` for manual handling.
 
-5. **Custom fields with data but no representation on source screens** won't appear in `extract` step 10. The `*all` field expansion only returns what Jira knows about the issue context, which for TMP means screen-mapped fields.
+5. **`stamp-keys` notification suppression** covers the field update itself only. Source automation rules listening on "Issue Updated" can still fire — **disable source TMP automation before running.**
 
-6. **`stamp-keys` notification suppression** is limited to the field update itself. Source automation rules that listen on "Issue Updated" can still fire. **Disable source TMP automation before running stamp-keys.**
+6. **Schemes, workflows, screens, and global custom fields are out of scope.** Create the target shell and assign schemes in the UI (§5.3.1); the toolkit only rebuilds versions, components, and sprints.
