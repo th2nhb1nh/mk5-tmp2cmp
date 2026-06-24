@@ -27,6 +27,7 @@ Jira UI. It also doesn't move the issues themselves; that's the native
    - 5.3. [Build the target shell + run `build`](#53-build-the-target-shell--run-build)
    - 5.4. [Bulk-move in the UI](#54-bulk-move-in-the-ui)
    - 5.5. [Run `update-sprints`](#55-run-update-sprints)
+   - 5.5b. [Run `export-sprint-csv` (closed-sprint fallback)](#55b-run-export-sprint-csv-closed-sprint-fallback)
    - 5.6. [Run `copy-fields`](#56-run-copy-fields)
    - 5.7. [Run `validate`](#57-run-validate)
    - 5.8. [Run `report`](#58-run-report)
@@ -45,7 +46,8 @@ Jira UI. It also doesn't move the issues themselves; that's the native
 | Source extract | `extract` | One pass over all source issues, plus version / component / sprint / role extraction and a full field catalog (with allowed values) built from `/editmeta`. Writes JSON + CSV. |
 | Key preservation | `stamp-keys` | Writes each source issue's current key into a designated text custom field (`customfield_25199` by default) so the original key survives the bulk-move key change. |
 | Target rebuild | `build` | Recreates versions, components, and sprints in the pre-built target CMP. Outputs ID-mapping CSVs used by the bulk-move wizard and by later phases. |
-| Sprint re-stitch | `update-sprints` | After bulk-move, rewrites the Sprint field on target issues from source sprint IDs to the new target sprint IDs (reopening/re-closing closed sprints as needed). |
+| Sprint re-stitch (API) | `update-sprints` | After bulk-move, rewrites the Sprint field on target issues from source sprint IDs to the new target sprint IDs (reopening/re-closing closed sprints as needed). |
+| Sprint re-stitch (CSV) | `export-sprint-csv` | After bulk-move, emits a semicolon-delimited CSV (`sprint_import.csv`) mapping each target issue to its new sprint id(s), for Jira's **External System Import**. The reliable fallback when closed sprints block `update-sprints`. No writes — you import the CSV manually. |
 | Field re-stitch | `copy-fields` | After bulk-move, copies field values from each source issue to its target counterpart, joining on the stamped key and a `field_mapping.csv` you provide. |
 | Post-move check | `validate` | Compares source baseline counts against target post-move counts, plus optional sprint-membership and field-value sampling. |
 | Reporting | `report` | Generates a formatted multi-sheet Excel workbook (`migration_report.xlsx`) for the project team, including a full source-key → target-key map. |
@@ -132,7 +134,7 @@ cp .env.example .env
 | `JIRA_EMAIL` | Always | all | Email of the account that owns the API token. |
 | `JIRA_API_TOKEN` | Always | all | From id.atlassian.com (see §2.2). Token only — there is no `--token` flag. |
 | `JIRA_SOURCE_KEY` | Per command | extract, stamp-keys, copy-fields, report | Source TMP project key. |
-| `JIRA_TARGET_KEY` | Per command | build, update-sprints, copy-fields, validate, report | Target CMP project key. |
+| `JIRA_TARGET_KEY` | Per command | build, update-sprints, export-sprint-csv, copy-fields, validate, report | Target CMP project key. |
 | `JIRA_KEY_FIELD` | Optional | stamp-keys, copy-fields, validate, report | Text field for the preserved key. Default `customfield_25199`. |
 | `JIRA_OUTPUT_DIR` | Optional | all | Artifacts directory. Default `./out`. |
 | `JIRA_TARGET_BOARD_ID` | Optional | build | Target Scrum board id; required for sprint creation. |
@@ -323,6 +325,69 @@ python3 tmp_to_cmp.py update-sprints --target-key TMP
 
 **Resume:** checkpointed in `./out/update_sprints/updated.txt`. Per-sprint cycle outcomes go to `sprint_cycle_log.csv`; failures to `failures.csv`.
 
+> **If closed sprints get in your way:** the reopen/re-close cycle this command
+> performs is fragile — it fails when the board disallows more than one active
+> sprint, and it skips issues that belong to multiple closed sprints. When that
+> happens, skip the API approach entirely and use
+> [`export-sprint-csv`](#55b-run-export-sprint-csv-closed-sprint-fallback) (§5.5b)
+> instead: it sets sprint membership by id through Jira's External Import, which
+> has no such restriction on closed sprints.
+
+---
+
+### 5.5b. Run `export-sprint-csv` (closed-sprint fallback)
+
+**Purpose:** `update-sprints` rewrites the Sprint field through the REST API,
+which can only attach an issue to a *closed* sprint by temporarily reopening it.
+That breaks down when a board forbids more than one active sprint, or when an
+issue spans several closed sprints. Jira's built-in **External System Import**
+sets the Sprint field by **sprint id** with no reopen/re-close dance, so it is
+the reliable way to re-attach historical sprint membership. This command
+produces the CSV that import consumes — it makes **no writes** to Jira; the
+import itself is a manual UI step.
+
+It reads the same `build/sprint_id_mapping.csv` as `update-sprints`, scans the
+target project for every issue that still carries a sprint, maps the source
+sprint ids to the target sprint ids, and writes one row per issue.
+
+```bash
+python3 tmp_to_cmp.py export-sprint-csv --target-key TMP
+```
+
+**Output:** `./out/export_sprint_csv/sprint_import.csv`, a **semicolon-delimited**
+(`;`) CSV with these columns:
+
+| Column | Notes |
+|---|---|
+| `Issue Key` | The live target issue key (used by import to match the issue). |
+| `Assignee` | The assignee's email address (falls back to account id, then display name; blank if unassigned). |
+| `Summary` | Issue summary (for human readability during the import field-mapping step). |
+| `Project name` | Target project name. |
+| `Project Key` | Target project key. |
+| `Project Type` | Target project type key (e.g. `software`). |
+| `Sprint ID` | The **target** sprint id(s). An issue in more than one sprint gets all its ids **comma-separated** in this single cell. |
+
+The delimiter is a semicolon **on purpose**: the `Sprint ID` cell uses commas to
+separate multiple ids, so a comma can't also be the field separator. Fields that
+themselves contain a semicolon (e.g. a summary) are double-quoted per standard
+CSV rules, so the file round-trips cleanly.
+
+Issues whose source sprint has no target mapping are **omitted** from the import
+CSV and listed in `./out/export_sprint_csv/missing_sprint_map.csv` for follow-up
+(rerun `build` if a sprint is missing from the mapping).
+
+**Importing into Jira:**
+
+1. Jira → **Settings** → **System** → **External System Import** → **CSV**.
+2. Upload `sprint_import.csv`. On the settings screen set the **delimiter to
+   semicolon (`;`)**.
+3. On the field-mapping screen, map `Issue Key` to **Issue key** (so import
+   updates existing issues rather than creating new ones), `Sprint ID` to
+   **Sprint**, and the remaining columns to their like-named fields.
+4. Run the import and review Jira's import log.
+
+This command is read-only and safe to re-run; it overwrites the CSV each time.
+
 ---
 
 ### 5.6. Run `copy-fields`
@@ -427,6 +492,12 @@ Subcommands:
       Rewrite the Sprint field on target issues from source to target sprint IDs,
       reopening/re-closing closed sprints as needed. Needs build/sprint_id_mapping.csv.
 
+  export-sprint-csv --target-key Y
+      Emit a semicolon-delimited CSV (./out/export_sprint_csv/sprint_import.csv)
+      mapping each target issue to its new sprint id(s), for Jira's External
+      System Import. Read-only fallback for closed sprints. Needs
+      build/sprint_id_mapping.csv.
+
   copy-fields --source-key X --target-key Y [--key-field customfield_25199] [--dry-run]
       Copy mapped field values from source to target, joining on the stamped key.
       Needs ./out/mapping/field_mapping.csv.
@@ -476,6 +547,9 @@ out/
 │   ├── multi_closed_issues.csv            # If any (manual follow-up)
 │   ├── sprint_cycle_log.csv               # Reopen/close outcomes per closed sprint
 │   └── failures.csv                       # If any
+├── export_sprint_csv/
+│   ├── sprint_import.csv                  # Semicolon-delimited; for Jira External Import
+│   └── missing_sprint_map.csv            # If any (issues with no target sprint mapping)
 ├── copy_fields/
 │   ├── copied.txt                         # Checkpoint
 │   └── failures.csv                       # If any
@@ -543,7 +617,7 @@ A board can have only one active sprint unless **parallel sprints** are enabled.
 
 3. **Board configuration is exported to JSON for reference only.** Columns, swimlanes, quick filters, card layout — all manual rebuild. Usually a good chance to clean these up rather than copy blindly.
 
-4. **Issues spanning multiple closed sprints are skipped by `update-sprints`** unless parallel sprints are enabled on the target board. They're listed in `multi_closed_issues.csv` for manual handling.
+4. **Issues spanning multiple closed sprints are skipped by `update-sprints`** unless parallel sprints are enabled on the target board. They're listed in `multi_closed_issues.csv`. The robust workaround is `export-sprint-csv` (§5.5b): it sets sprint membership by id via Jira's External System Import, which has no reopen/active-sprint restriction, so closed and multi-closed sprints import cleanly.
 
 5. **`stamp-keys` notification suppression** covers the field update itself only. Source automation rules listening on "Issue Updated" can still fire — **disable source TMP automation before running.**
 

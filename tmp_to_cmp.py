@@ -9,6 +9,9 @@ Subcommands:
   copy-fields    Copy field values from source to target using mapping CSV.
   build          Recreate versions/components/sprints in target.
   update-sprints Replace source sprint IDs with target sprint IDs after bulk move.
+  export-sprint-csv  Emit a semicolon-delimited CSV for Jira's External Import
+                 feature to re-attach sprint membership by sprint id (the
+                 reliable fallback when closed sprints block update-sprints).
   validate       Compare baseline counts after move.
 
 Uses /rest/api/3/issue/{key}/editmeta to retrieve allowed values for select fields.
@@ -531,10 +534,10 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
     logging.info("Wrote %s", path)
 
-def write_csv(path: Path, rows: List[Dict], fieldnames: List[str]) -> None:
+def write_csv(path: Path, rows: List[Dict], fieldnames: List[str], delimiter: str = ",") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore", delimiter=delimiter)
         writer.writeheader()
         writer.writerows(rows)
     logging.info("Wrote %s (%d rows)", path, len(rows))
@@ -1144,6 +1147,164 @@ def cmd_update_sprints(cfg: Config) -> None:
         write_csv(out / "failures.csv", failures, ["issue", "phase", "error"])
 
     logging.info("UPDATE-SPRINTS complete. Updated %d issues. Failures: %d.", updated, len(failures))
+
+
+# ---------------------------------------------------------------------------
+# EXPORT-SPRINT-CSV (External Import fallback for closed sprints)
+# ---------------------------------------------------------------------------
+# Jira's built-in External System Import (Settings -> System -> External System
+# Import -> CSV) sets the Sprint field by id without the reopen/re-close dance
+# that `update-sprints` needs for closed sprints, so it is the most reliable way
+# to re-attach historical sprint membership. This module produces the CSV that
+# import consumes.
+#
+# Delimiter is a *semicolon* on purpose: the Sprint ID column may hold several
+# comma-separated ids for issues that belonged to more than one sprint, so a
+# comma cannot also be the field separator.
+SPRINT_CSV_DELIMITER = ";"
+SPRINT_CSV_HEADERS = [
+    "Issue Key",
+    "Assignee",
+    "Summary",
+    "Project name",
+    "Project Key",
+    "Project Type",
+    "Sprint ID",
+]
+
+
+def _assignee_identifier(assignee: Optional[Dict]) -> str:
+    """Pick the most import-friendly identifier for an issue's assignee.
+
+    Jira's CSV importer matches users by email address or account id; email is
+    more human-readable so we prefer it, falling back to account id, then
+    display name. Returns "" for unassigned issues.
+    """
+    if not assignee:
+        return ""
+    return (
+        assignee.get("emailAddress")
+        or assignee.get("accountId")
+        or assignee.get("displayName")
+        or ""
+    )
+
+
+def _collect_sprint_csv_rows(
+    client: JiraClient,
+    target_key: str,
+    sprint_field_id: str,
+    sprint_map: Dict[str, str],
+) -> tuple[List[Dict[str, str]], List[tuple]]:
+    """Scan the target project once and build the External Import rows.
+
+    Mirrors the source->target sprint id mapping in `_plan_sprint_updates`
+    (deduped, order-preserving) but also captures the issue fields the importer
+    needs (assignee, summary, project). Issues are read from the *target*
+    project, where the Sprint field still references the *source* sprint ids
+    after a bulk-move.
+
+    Returns (rows, missing_map):
+      - rows: dicts keyed by SPRINT_CSV_HEADERS, target sprint ids joined by ","
+      - missing_map: [(issue_key, [unmapped_source_sprint_id, ...]), ...]
+    """
+    rows: List[Dict[str, str]] = []
+    missing_map: List[tuple] = []
+    fields = [sprint_field_id, "summary", "assignee", "project"]
+    jql = f'project = "{target_key}" AND sprint is not EMPTY'
+    for issue in client.search_jql(jql, fields=fields):
+        f = issue["fields"]
+        sprint_field = f.get(sprint_field_id)
+        if not sprint_field:
+            continue
+        sprint_objs = sprint_field if isinstance(sprint_field, list) else [sprint_field]
+        source_sprint_ids = [str(s.get("id")) for s in sprint_objs if isinstance(s, dict) and s.get("id") is not None]
+
+        target_ids: List[str] = []
+        unmapped: List[str] = []
+        for sid in source_sprint_ids:
+            tid = sprint_map.get(sid)
+            if tid:
+                if tid not in target_ids:  # dedupe preserving order
+                    target_ids.append(tid)
+            else:
+                unmapped.append(sid)
+        if unmapped:
+            missing_map.append((issue["key"], unmapped))
+        if not target_ids:
+            continue
+
+        project = f.get("project") or {}
+        rows.append({
+            "Issue Key": issue["key"],
+            "Assignee": _assignee_identifier(f.get("assignee")),
+            "Summary": f.get("summary") or "",
+            "Project name": project.get("name", ""),
+            "Project Key": project.get("key", ""),
+            "Project Type": project.get("projectTypeKey", ""),
+            "Sprint ID": ",".join(target_ids),
+        })
+    return rows, missing_map
+
+
+def cmd_export_sprint_csv(cfg: Config) -> None:
+    """Generate a semicolon-delimited CSV for Jira's External Import feature to
+    re-attach sprint membership by *sprint id*.
+
+    Why this exists: `update-sprints` rewrites the Sprint field via the REST
+    API, which requires reopening closed sprints. That fails when a board
+    disallows more than one active sprint, or when an issue spans several closed
+    sprints (such issues are skipped and listed in `multi_closed_issues.csv`).
+    Jira's built-in External System Import sets the Sprint field by id without
+    any reopen/re-close cycle, so it is the reliable path for closed sprints.
+    This command produces the CSV that import consumes — it performs no writes
+    against Jira itself; the import is a manual UI step.
+
+    Reads the same `build/sprint_id_mapping.csv` as `update-sprints`, scans the
+    target project for every issue that still has a sprint, maps source sprint
+    ids to target sprint ids, and writes one row per issue.
+    """
+    client = JiraClient(cfg.base_url, cfg.email, cfg.api_token)
+    preflight(client, target_key=cfg.target_key, target_must_exist=True)
+
+    mapping_path = cfg.output_dir / "build" / "sprint_id_mapping.csv"
+    if not mapping_path.exists():
+        raise SystemExit(f"Sprint mapping not found: {mapping_path}. Run 'build' first.")
+
+    sprint_map = load_sprint_id_map(mapping_path)
+    if not sprint_map:
+        logging.warning("No sprint mappings found. Nothing to export.")
+        return
+
+    sprint_field_id = client.sprint_field_id()
+    logging.info("Using sprint field id: %s", sprint_field_id)
+
+    out = cfg.output_dir / "export_sprint_csv"
+    out.mkdir(parents=True, exist_ok=True)
+
+    logging.info("Scanning target project %s for issues with sprints...", cfg.target_key)
+    rows, missing_map = _collect_sprint_csv_rows(client, cfg.target_key, sprint_field_id, sprint_map)
+
+    csv_path = out / "sprint_import.csv"
+    write_csv(csv_path, rows, SPRINT_CSV_HEADERS, delimiter=SPRINT_CSV_DELIMITER)
+
+    if missing_map:
+        write_csv(
+            out / "missing_sprint_map.csv",
+            [{"issue": k, "unmapped_source_sprint_ids": ",".join(ids)} for k, ids in missing_map],
+            ["issue", "unmapped_source_sprint_ids"],
+        )
+        logging.warning(
+            "%d issue(s) referenced source sprints with no target mapping and were "
+            "omitted from the import CSV. See %s",
+            len(missing_map), out / "missing_sprint_map.csv",
+        )
+
+    logging.info(
+        "EXPORT-SPRINT-CSV complete. Wrote %d row(s) to %s (delimiter '%s'). "
+        "Import via Jira Settings -> System -> External System Import -> CSV.",
+        len(rows), csv_path, SPRINT_CSV_DELIMITER,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2168,6 +2329,9 @@ def build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--target-key", required=False)
     pu.add_argument("--dry-run", action="store_true")
 
+    px = sub.add_parser("export-sprint-csv", help="Emit a semicolon-delimited CSV for Jira's External Import to set sprint membership by id.")
+    px.add_argument("--target-key", required=False)
+
     pv = sub.add_parser("validate")
     pv.add_argument("--target-key", required=False)
     pv.add_argument("--key-field")
@@ -2186,6 +2350,7 @@ COMMANDS = {
     "copy-fields": cmd_copy_fields,
     "build": cmd_build,
     "update-sprints": cmd_update_sprints,
+    "export-sprint-csv": cmd_export_sprint_csv,
     "validate": cmd_validate,
     "report": cmd_report,
 }
