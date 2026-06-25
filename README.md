@@ -1,458 +1,613 @@
 # Jira TMP → CMP Migration Toolkit
 
-A Python CLI that handles **Phase 3** of a team-managed (TMP) → company-managed
-(CMP) Jira project migration: pulling configuration off the source project,
-preserving each issue's original key in a custom field so post-move work can
-join on it, rebuilding versions / components / sprints in the target project,
-re-stitching sprint membership and field values after the bulk-move, validating
-the result, and generating a polished Excel report for the project team.
+A Python command-line tool for moving a Jira project from **team-managed** to
+**company-managed**, with all the before-and-after bookkeeping that Jira's native
+bulk-move leaves on the floor.
 
-It deliberately does **not** create schemes, workflows, screens, or global
-custom fields — those need human design decisions and are best done in the
-Jira UI. It also doesn't move the issues themselves; that's the native
-**bulk-move** step you run in the UI during the cutover window.
+---
+
+I've run a fair number of these migrations, and here's the thing nobody tells you
+up front: the issue move itself is the easy part. Jira does that for you. What
+eats your week is everything *around* it — preserving original keys, rebuilding
+sprints so velocity charts don't fall apart, copying over the custom fields that
+quietly vanish, and then proving to a skeptical project lead that nothing got
+lost. That's what this toolkit is for. It handles the boring, error-prone, do-it-
+exactly-right parts so you can focus on the judgment calls.
+
+This README is written as a tutorial. If you read it top to bottom and run the
+commands in order, you'll get through a clean migration. I've tried to flag the
+spots where I've personally been burned, because those are the ones that'll cost
+you a re-run (or a very awkward Slack message) if you skip them.
+
+A quick word on who this is for: you don't have to be a developer, but you do need
+a Jira admin account and a willingness to read the output. The tool is chatty on
+purpose — when something's wrong, it tells you what and usually why.
 
 ---
 
 ## Table of contents
 
-1. [What this toolkit does](#1-what-this-toolkit-does)
-2. [Prerequisites](#2-prerequisites)
-3. [Install](#3-install)
-4. [Configure credentials](#4-configure-credentials)
-5. [Step-by-step workflow](#5-step-by-step-workflow)
-   - 5.0. [Run `doctor` first](#50-run-doctor-first)
-   - 5.1. [Run `extract`](#51-run-extract)
-   - 5.2. [Run `stamp-keys`](#52-run-stamp-keys)
-   - 5.3. [Build the target shell + run `build`](#53-build-the-target-shell--run-build)
-   - 5.4. [Bulk-move in the UI](#54-bulk-move-in-the-ui)
-   - 5.5. [Run `update-sprints`](#55-run-update-sprints)
-   - 5.5b. [Run `export-sprint-csv` (closed-sprint fallback)](#55b-run-export-sprint-csv-closed-sprint-fallback)
-   - 5.6. [Run `copy-fields`](#56-run-copy-fields)
-   - 5.7. [Run `validate`](#57-run-validate)
-   - 5.8. [Run `report`](#58-run-report)
-6. [Command reference](#6-command-reference)
-7. [Output artifacts](#7-output-artifacts)
-8. [Troubleshooting](#8-troubleshooting)
-9. [Known limitations](#9-known-limitations)
+1. [What we're actually doing here](#1-what-were-actually-doing-here)
+2. [Glossary, so we're speaking the same language](#2-glossary-so-were-speaking-the-same-language)
+3. [The full migration arc](#3-the-full-migration-arc)
+4. [Prerequisites — get these squared away first](#4-prerequisites--get-these-squared-away-first)
+5. [Installing the tool](#5-installing-the-tool)
+6. [Credentials and the `.env` file](#6-credentials-and-the-env-file)
+7. [The walkthrough](#7-the-walkthrough)
+   - [7.0 `doctor` — kick the tires](#70-doctor--kick-the-tires)
+   - [7.1 `extract` — snapshot the source](#71-extract--snapshot-the-source)
+   - [7.2 `stamp-keys` — give every issue a name tag](#72-stamp-keys--give-every-issue-a-name-tag)
+   - [7.3 `build` — stand up the target's structure](#73-build--stand-up-the-targets-structure)
+   - [7.4 The bulk-move (you, in the Jira UI)](#74-the-bulk-move-you-in-the-jira-ui)
+   - [7.5 `update-sprints` — put issues back on their sprints](#75-update-sprints--put-issues-back-on-their-sprints)
+   - [7.5b `export-sprint-csv` — the move that always works](#75b-export-sprint-csv--the-move-that-always-works)
+   - [7.6 `copy-fields` — bring the field values across](#76-copy-fields--bring-the-field-values-across)
+   - [7.7 `validate` — prove nothing was lost](#77-validate--prove-nothing-was-lost)
+   - [7.8 `report` — the deliverable for the team](#78-report--the-deliverable-for-the-team)
+8. [Command reference](#8-command-reference)
+9. [Everything the tool writes to `out/`](#9-everything-the-tool-writes-to-out)
+10. [Troubleshooting — the stuff that actually goes wrong](#10-troubleshooting--the-stuff-that-actually-goes-wrong)
+11. [Known limitations — read before you promise anything](#11-known-limitations--read-before-you-promise-anything)
 
 ---
 
-## 1. What this toolkit does
+## 1. What we're actually doing here
 
-| Phase | Subcommand | What it does |
+Quick refresher on the two project types, because the whole migration hinges on
+the difference. **Team-managed projects (TMP)** are the ones a team can spin up
+and configure themselves — everything lives inside the project, which is great for
+autonomy and terrible for standardization. **Company-managed projects (CMP)** pull
+their workflows, fields, and schemes from shared, admin-controlled configuration.
+When an org matures, or wants reporting and governance across teams, TMP → CMP is
+the move.
+
+Here's the honest division of labor:
+
+- **Jira's bulk-move** carries the issues themselves — history, comments,
+  attachments, worklogs. It's solid. You run it in the browser.
+- **This toolkit** handles everything bulk-move drops or scrambles: original issue
+  keys, sprint membership (especially closed sprints), TMP-scoped custom field
+  values, and the validation + reporting you'll want when it's done.
+
+Think of it like a house move. You photograph every room before you pack
+(`extract`), label every box so you know where it came from (`stamp-keys`), build
+matching shelves at the new place (`build`), call the movers (bulk-move), put the
+boxes back where they belong (`update-sprints`, `copy-fields`), walk through to
+make sure nothing's missing (`validate`), and hand everyone a summary of how it
+went (`report`).
+
+**What this tool deliberately won't do:** create workflows, screens, permission
+schemes, or global custom fields. Those are design decisions, and they're far
+safer to make by hand in the UI where Jira gives you the proper dialogs. The tool
+sticks to the mechanical, repeatable stuff — versions, components, sprints, field
+values, and reconciliation.
+
+Two design choices that'll save your bacon:
+
+- **Dry-run everything.** Every command that writes takes `--dry-run`. It shows
+  you exactly what it *would* do without touching Jira. I dry-run every single
+  time, even when I'm sure. Costs nothing, catches plenty.
+- **It picks up where it left off.** These runs can take a while on a big project,
+  and networks hiccup. If a command dies halfway, just run it again — it keeps a
+  checkpoint and skips what it already finished. Re-running a completed step is a
+  no-op.
+
+---
+
+## 2. Glossary, so we're speaking the same language
+
+| Term | What it means in practice |
+|---|---|
+| **TMP** | *Team-managed project* — your **source**, the project you're migrating away from. |
+| **CMP** | *Company-managed project* — your **target**, the project you're migrating into. |
+| **Issue** | Any work item — story, bug, task, sub-task. |
+| **Issue key** | The issue's name, like `TMP-123`. Bulk-move changes these, which is the root of half our work. |
+| **Project key** | The prefix on every issue key (`TMP`, `ABC`…). Case-sensitive in the API — bite me once, shame on Jira. |
+| **Bulk-move** | Jira's native cross-project move. Browser only. This toolkit doesn't do it; it sets it up and cleans up after. |
+| **Sprint** | A time-boxed batch of work on a board. State is future, active, or closed — and closed sprints are where the pain lives. |
+| **Version / Component** | Structural labels on a project ("Release 2.1", "Backend"). |
+| **Custom field** | Any field beyond Jira's built-ins, identified like `customfield_25199`. |
+| **Board** | The Scrum/Kanban board a project's sprints hang off of, identified by a numeric **board ID**. |
+| **JQL** | *Jira Query Language* — the search syntax (`project = "TMP" AND ...`). |
+| **API token** | A password-equivalent secret the tool uses to act as your account. |
+| **Idempotent** | Engineer-speak for "safe to run twice." Re-running skips finished work. |
+
+> **The one gotcha to internalize now: the key field has two different names.**
+> To keep each issue's original key through the move, we stash it in a text custom
+> field. That field gets referenced two ways — by its **id**
+> (`customfield_25199`, used when reading or writing the value) and by its **JQL
+> name** (`Original Work Item Key[Short text]`, used when *searching* for it). They
+> are not interchangeable, and mixing them up is the single most common reason
+> these scripts throw a 400. You'll set both in `.env`, and `doctor` prints them
+> side by side so you can eyeball it. More in [§7.0](#70-doctor--kick-the-tires)
+> and the [troubleshooting section](#field-customfield_25199-does-not-exist-jql-400).
+
+---
+
+## 3. The full migration arc
+
+Everything runs in this order. The one manual step — the bulk-move — sits right in
+the middle. The toolkit gets you ready for it, then stitches things back together
+on the far side.
+
+```
+   SOURCE (old TMP)                                  TARGET (new CMP)
+   ───────────────                                   ────────────────
+
+   ┌─────────────┐
+   │   doctor    │  ← always first: "can I auth and see both projects?"
+   └─────────────┘
+
+   ┌─────────────┐
+   │  extract    │  ── snapshot the source ──►   (baseline saved to ./out)
+   └─────────────┘
+   ┌─────────────┐
+   │ stamp-keys  │  ── tag each issue with its
+   └─────────────┘     original key so it survives the move
+
+                                                    ┌─────────────┐
+                          rebuild structure ─────►  │   build     │
+                                                    └─────────────┘
+                                                    (versions, components,
+                                                     sprints + mapping CSVs)
+
+        ════════════ BULK-MOVE (you, in the Jira browser UI) ════════════
+        Move all issues source → target using the mapping CSVs from build.
+        Then optionally rename projects so the new one inherits the old key.
+
+                                                    ┌──────────────────┐
+                              reconnect sprints ──► │ update-sprints   │
+                                                    │  or              │
+                                                    │ export-sprint-csv│
+                                                    └──────────────────┘
+                                                    ┌─────────────┐
+                              copy field values ──► │ copy-fields │
+                                                    └─────────────┘
+                                                    ┌─────────────┐
+                              check + report ─────► │  validate   │
+                                                    │  report     │
+                                                    └─────────────┘
+```
+
+The one-liner on each:
+
+| When | Command | What it does |
 |---|---|---|
-| Preflight | `doctor` | Verifies your token works, you can see the project(s), lists boards, and resolves the Sprint custom field id. Run this first. No writes. |
-| Source extract | `extract` | One pass over all source issues, plus version / component / sprint / role extraction and a full field catalog (with allowed values) built from `/editmeta`. Writes JSON + CSV. |
-| Key preservation | `stamp-keys` | Writes each source issue's current key into a designated text custom field (`customfield_25199` by default) so the original key survives the bulk-move key change. |
-| Target rebuild | `build` | Recreates versions, components, and sprints in the pre-built target CMP. Outputs ID-mapping CSVs used by the bulk-move wizard and by later phases. |
-| Sprint re-stitch (API) | `update-sprints` | After bulk-move, rewrites the Sprint field on migrated target issues from source sprint IDs to the new target sprint IDs (reopening/re-closing closed sprints as needed). Scoped to migrated issues only. |
-| Sprint re-stitch (CSV) | `export-sprint-csv` | After bulk-move, emits a semicolon-delimited CSV (`sprint_import.csv`) mapping each target issue to its new sprint id(s), for Jira's **External System Import**. The reliable fallback when closed sprints block `update-sprints`. No writes — you import the CSV manually. |
-| Field re-stitch | `copy-fields` | After bulk-move, copies field values from each source issue to its target counterpart, joining on the stamped key and a `field_mapping.csv` you provide. |
-| Post-move check | `validate` | Compares source baseline counts against target post-move counts (target side scoped to **migrated issues only** — those with a stamped key), plus optional sprint-membership and field-value sampling. |
-| Reporting | `report` | Generates a formatted multi-sheet Excel workbook (`migration_report.xlsx`) for the project team, including a full source-key → target-key map. Target-side numbers are scoped to **migrated issues only**. |
+| Preflight | `doctor` | Confirms auth, project access, and that your settings resolve. Read-only — never writes a thing. |
+| Pre-move | `extract` | Snapshots the source: issue counts, versions, components, sprints, and a full field catalog. Your baseline. |
+| Pre-move | `stamp-keys` | Writes each issue's current key into a text field so it survives bulk-move's re-keying. |
+| Pre-move | `build` | Recreates versions, components, and sprints in the target, and writes the mapping CSVs the bulk-move wizard needs. |
+| **Manual** | *bulk-move* | Jira moves the issues. Not part of this tool. |
+| Post-move | `update-sprints` | Re-points moved issues at the matching target sprints. |
+| Post-move | `export-sprint-csv` | The reliable fallback for closed sprints — emits a CSV you import via External System Import. |
+| Post-move | `copy-fields` | Copies dropped custom-field values, matching old issue to new via the stamped key. |
+| Post-move | `validate` | Compares the target against the `extract` baseline and flags anything off. |
+| Post-move | `report` | Generates a multi-sheet Excel workbook for the team. |
 
-All write phases are **idempotent**: re-running skips work already done.
-Versions / components / sprints dedup by name; `stamp-keys`, `copy-fields`, and
-`update-sprints` each use a checkpoint file so an interrupted run resumes
-cleanly.
+> **Why the post-move steps only count "migrated issues."** If your target is
+> brand-new, ignore this. But a lot of real migrations consolidate *into* a
+> project that already has issues. In that case, the tool has to compare and
+> update only the issues that came from the source — not the ones already living
+> there. It tells them apart by the stamped key. That's the real reason
+> `stamp-keys` matters even if you don't personally care about old key numbers.
 
 ---
 
-## 2. Prerequisites
+## 4. Prerequisites — get these squared away first
 
-### 2.1 Python 3.10 or later
+### 4.1 Python 3.10 or newer
 
-Check: `python3 --version`. If older, install a current Python.
+`python3 --version`. If it's older, grab a current build from
+[python.org](https://www.python.org/) or your package manager. Don't fight an
+ancient Python; just install a fresh one.
 
-### 2.2 An Atlassian API token
+### 4.2 An Atlassian API token
 
-1. Sign in to https://id.atlassian.com/manage-profile/security/api-tokens with the account that will run the script.
-2. Click **Create API token**, label it `tmp-to-cmp-migration`, copy the token.
-3. Treat it like a password. It expires after the period set on creation.
+1. Sign in at <https://id.atlassian.com/manage-profile/security/api-tokens> as
+   **the account that's going to run the migration**.
+2. **Create API token**, name it something honest like `tmp-to-cmp-migration`, and
+   copy it somewhere safe.
+3. Treat it like a password. It expires on whatever date you picked at creation —
+   set a reminder if your migration window is far out.
 
-The script authenticates as **the account that owns the token**. That account needs:
-- **Browse Projects** + **Edit Issues** on the source TMP (for extract / stamp-keys).
-- **Browse Projects** + **Administer Project** on the target CMP (for version/component creation and field edits).
-- **Manage Sprints** on the target board (for sprint creation and the reopen/close cycle in `update-sprints`).
+The tool acts as whoever owns the token, so that account needs:
 
-A site admin or org admin satisfies all of these by default. If you're using a non-admin token, verify each permission before running.
+| Where | Permissions | For |
+|---|---|---|
+| Source TMP | Browse Projects + Edit Issues | `extract`, `stamp-keys` |
+| Target CMP | Browse Projects + Administer Project | versions/components, field edits |
+| Target board | Manage Sprints | sprint creation and the reopen/close cycle |
 
-### 2.3 Source project setup (one-time, in the UI)
+A site or org admin has all of this by default. Running with a scoped-down
+service account? Verify each permission before you start — finding out mid-run
+that you can't manage sprints is a bad time.
 
-Before running `stamp-keys`, the text field you'll use to preserve original keys (default: `customfield_25199`) must be on **every edit screen** of **every issue type** in the source TMP. Without this, the API returns 200 OK on the update but silently drops the value.
+### 4.3 One-time source setup (in the UI)
 
-In a TMP this means:
-1. Source TMP → **Project settings** → **Issue types**.
+Before `stamp-keys` will work, the text field you're using to preserve keys
+(default `customfield_25199`) has to be on the **edit screen of every issue type**
+in the source TMP. This trips people up because Jira will happily return `200 OK`
+on an update to a field that isn't on the screen — and silently drop the value.
+Looks like it worked. Didn't.
+
+In a team-managed project:
+
+1. Source project → **Project settings** → **Issue types**.
 2. For each issue type, drag the field onto the layout.
 3. Save.
 
-`stamp-keys` does a test-stamp-and-readback on the first issue and aborts with a clear error if the field isn't wired up — so you don't have to trust this manually.
+You don't have to take this on faith. `stamp-keys` writes one test issue and reads
+it back before doing anything else, and it stops cold with a clear error if the
+value didn't stick. That readback has saved me more than once.
 
-### 2.4 Finding your IDs
+### 4.4 The IDs you'll need to dig up
 
-| What | Where to find it |
+| What | Where it lives |
 |---|---|
-| **Project key** | The prefix in any issue key (e.g. `TMP-123` → key is `TMP`). Also in `Project settings → Details`. Case-sensitive in the API. |
-| **Board ID** | Open the board in the UI. URL is `/jira/software/projects/<KEY>/boards/<ID>` (or `?rapidView=<ID>`) — the trailing number is the board ID. `doctor` also prints board IDs for both projects. |
-| **Account ID** (for `--target-lead`) | URL of a user's profile, or via API: `GET /rest/api/3/user/search?query=<email>`. |
-| **Custom field ID** | Site admin → **Issues** → **Custom fields**, or call `GET /rest/api/3/field` and grep by name. Always starts with `customfield_`. The `extract` step's field catalog (§7) lists every project-scoped field with its id. |
-
-### 2.5 The key field needs both an **id** and a **JQL name**
-
-The preserved-key custom field is referenced two different ways, so the toolkit
-needs both forms:
-
-- **Id** (`JIRA_KEY_FIELD`, e.g. `customfield_25199`) — used when *writing* the
-  field (editIssue payloads in `stamp-keys`/`copy-fields`) and when *reading*
-  the stamped value back.
-- **Name** (`JIRA_KEY_FIELD_NAME`, e.g. `Original Work Item Key[Short text]`) —
-  used in **JQL**. Jira's JQL matches a custom field by its name (or `cf[id]`),
-  **not** by the `customfield_x` id string. Filtering on
-  `"customfield_25199" IS NOT EMPTY` raises *"Field 'customfield_25199' does not
-  exist"*; the working form is `"Original Work Item Key[Short text]" IS NOT EMPTY`.
-
-Use the **exact** name shown in the field picker, including any disambiguator
-Jira appends in brackets such as `[Short text]`. If you leave
-`JIRA_KEY_FIELD_NAME` blank, the toolkit resolves the name from the id at runtime
-via `/rest/api/3/field` — that works when the name is unambiguous, but setting it
-explicitly is recommended. Run `doctor` to see the id and the resolved JQL name
-side by side.
+| **Project key** | Prefix of any issue key (`TMP-123` → `TMP`). Also **Project settings → Details**. Case-sensitive. |
+| **Board ID** | Open the board; the URL ends in `/boards/<ID>` or `?rapidView=<ID>`. `doctor` prints these for both projects too. |
+| **Account ID** (for `--target-lead`) | A user's profile URL, or `GET /rest/api/3/user/search?query=<email>`. |
+| **Custom field ID** | Admin → **Issues** → **Custom fields**, or `GET /rest/api/3/field`. Always starts with `customfield_`. The `extract` catalog lists them too. |
 
 ---
 
-## 3. Install
+## 5. Installing the tool
 
 ```bash
-# Clone or copy the script directory, then:
 cd mk5-tmp2cmp
-python3 -m venv .venv
+python3 -m venv .venv          # isolated environment so you don't pollute system Python
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Tested on Python 3.10+. Dependencies (see `requirements.txt`):
-- `requests` — HTTP client.
-- `python-dotenv` — auto-loads `.env` (optional but recommended).
-- `openpyxl` — only needed for the `report` command's Excel output.
+Three dependencies, nothing exotic:
+
+- **`requests`** — the HTTP client that talks to Jira.
+- **`python-dotenv`** — auto-loads your `.env` so you're not exporting variables by hand.
+- **`openpyxl`** — only the `report` command needs it, for the Excel output.
 
 ---
 
-## 4. Configure credentials
+## 6. Credentials and the `.env` file
 
-The script reads its configuration from environment variables. If a `.env` file
-is present it is **loaded automatically on every run** (via `python-dotenv`) —
-you do **not** need to `source` it. Copy the template and fill it in:
+Configuration comes from environment variables, and the easiest path is a `.env`
+file in the project folder. The tool **loads it automatically on every run** — no
+`source` step, no exporting. Set it once.
 
 ```bash
 cp .env.example .env
-# edit .env
+# open .env and fill it in
 ```
 
-| Variable | Required? | Used by | Notes |
+The whole idea: **populate `.env` once and your commands get short.** With it
+filled in, you're just running `python3 tmp_to_cmp.py extract`, `… build`,
+`… validate`, and so on — no repeating `--source-key` / `--target-key` every time.
+Every value except the three auth secrets can still be overridden with a flag for
+a one-off.
+
+| Variable | Required? | Used by | What it is |
 |---|---|---|---|
-| `JIRA_BASE_URL` | Always | all | Site URL, no trailing slash. e.g. `https://your-site.atlassian.net` |
-| `JIRA_EMAIL` | Always | all | Email of the account that owns the API token. |
-| `JIRA_API_TOKEN` | Always | all | From id.atlassian.com (see §2.2). Token only — there is no `--token` flag. |
-| `JIRA_SOURCE_KEY` | Per command | extract, stamp-keys, copy-fields, report | Source TMP project key. |
-| `JIRA_TARGET_KEY` | Per command | build, update-sprints, export-sprint-csv, copy-fields, validate, report | Target CMP project key. |
-| `JIRA_KEY_FIELD` | Optional | stamp-keys, copy-fields, validate, report | Text field **id** for the preserved key. Default `customfield_25199`. Used in editIssue payloads and to read the stamped value. |
-| `JIRA_KEY_FIELD_NAME` | Optional | doctor, copy-fields, validate, report, export-sprint-csv | JQL **name** of the same field, e.g. `Original Work Item Key[Short text]`. JQL matches custom fields by name, not by the `customfield_x` id (see §2.5). If blank, the script resolves the name from the id at runtime. `doctor` prints the resolved name. |
-| `JIRA_OUTPUT_DIR` | Optional | all | Artifacts directory. Default `./out`. |
-| `JIRA_TARGET_BOARD_ID` | Optional | build | Target Scrum board id; required for sprint creation. |
-| `JIRA_TARGET_LEAD` | Optional | build | Lead accountId; required only with `--create-target`. |
-| `JIRA_TARGET_TEMPLATE` | Optional | build | Project template for `--create-target`. Defaults to Scrum (classic CMP). |
+| `JIRA_BASE_URL` | Always | all | Site URL, no trailing slash: `https://your-site.atlassian.net` |
+| `JIRA_EMAIL` | Always | all | Email of the account that owns the token |
+| `JIRA_API_TOKEN` | Always | all | The token from §4.2. There's no `--token` flag — it lives here only |
+| `JIRA_SOURCE_KEY` | Per command | extract, stamp-keys, copy-fields, report | Source (old) project key |
+| `JIRA_TARGET_KEY` | Per command | build, update-sprints, export-sprint-csv, copy-fields, validate, report | Target (new) project key |
+| `JIRA_KEY_FIELD` | Optional | stamp-keys, copy-fields, validate, report | Text field **id** for the preserved key. Default `customfield_25199` |
+| `JIRA_KEY_FIELD_NAME` | Optional | doctor, copy-fields, validate, report, export-sprint-csv | JQL **name** of that same field, e.g. `Original Work Item Key[Short text]` (see [the gotcha](#2-glossary-so-were-speaking-the-same-language)) |
+| `JIRA_OUTPUT_DIR` | Optional | all | Where artifacts land. Default `./out` |
+| `JIRA_TARGET_BOARD_ID` | Optional | build | Target Scrum board id; required to create sprints |
+| `JIRA_TARGET_LEAD` | Optional | build | Lead account id; only needed with `--create-target` |
+| `JIRA_TARGET_TEMPLATE` | Optional | build | Project template for `--create-target`. Defaults to Scrum (classic CMP) |
 
-**Put everything in `.env` once and forget the flags.** All per-command values
-above (project keys, board id, key field id/name, output dir, …) are read from
-`.env` on every run, so the workflow commands in §5 are just
-`python3 tmp_to_cmp.py extract`, `… build`, `… validate`, `… report`, etc. — no
-repeated `--source-key`/`--target-key`/`--key-field`. Every variable except the
-three auth values **can** still be passed as a CLI flag (`--source-key`,
-`--target-key`, `--key-field`, `--key-field-name`, `--output-dir`, …) to
-override `.env` for a single run. The script refuses to start if any of
-`JIRA_BASE_URL`, `JIRA_EMAIL`, or `JIRA_API_TOKEN` is missing.
+The tool refuses to start if `JIRA_BASE_URL`, `JIRA_EMAIL`, or `JIRA_API_TOKEN` is
+missing — better a clear failure than a confusing one.
 
-> **If you rename projects during the cutover (§5.4)**, the source/target keys
-> change mid-workflow (e.g. source `TMP`→`TMP_OLD`, target `NEW`→`TMP`). Update
-> `JIRA_SOURCE_KEY` / `JIRA_TARGET_KEY` in `.env` right after the rename (or pass
-> `--source-key` / `--target-key` to override) so the post-move commands
-> (`update-sprints`, `export-sprint-csv`, `copy-fields`, `validate`, `report`)
-> point at the renamed projects. If you keep stable keys (no rename), `.env`
-> needs no mid-run edits.
+> **If you rename projects during cutover** (covered in
+> [§7.4](#74-the-bulk-move-you-in-the-jira-ui)), your keys change mid-migration —
+> typically source `TMP`→`TMP_OLD` and target `NEW`→`TMP`. The moment you rename,
+> update `JIRA_SOURCE_KEY` / `JIRA_TARGET_KEY` in `.env` so the post-move commands
+> point at the right places. Keeping stable keys instead? Then `.env` never needs
+> a mid-run edit. Either way, decide this *before* you start, not at 11pm during
+> the window.
 
 ---
 
-## 5. Step-by-step workflow
+## 7. The walkthrough
 
-The phases in order. Each section explains what to run, what to expect, and what
-the command produces. The bulk-move itself (§5.4) is a manual UI step that sits
-in the middle of the toolkit run.
+We'll go phase by phase. Each one tells you **why** it exists, **what to run**, and
+**what you get out of it**. The bulk-move ([§7.4](#74-the-bulk-move-you-in-the-jira-ui))
+is the manual browser step in the middle — everything before it is prep,
+everything after is repair and reporting.
 
-### 5.0. Run `doctor` first
+> **House rule:** any command that writes, run with `--dry-run` first, read the
+> output, *then* run it for real. Every time.
 
-**Purpose:** Confirm the script can authenticate and see both projects before you invest time running anything real.
+### 7.0 `doctor` — kick the tires
+
+**Why:** Before you sink an hour into a real run, confirm the tool can authenticate
+and actually see both projects. `doctor` is read-only; it can't hurt anything.
 
 ```bash
 python3 tmp_to_cmp.py doctor
-# Reads JIRA_SOURCE_KEY / JIRA_TARGET_KEY / JIRA_KEY_FIELD[_NAME] from .env.
-# Override any of them for a one-off run, e.g.:
+# Pulls JIRA_SOURCE_KEY / JIRA_TARGET_KEY / JIRA_KEY_FIELD[_NAME] from .env.
+# One-off override:
 #   python3 tmp_to_cmp.py doctor --source-key TMP --target-key NEW
 ```
 
-If you only have a source project so far, leave `JIRA_TARGET_KEY` blank.
+Only have the source project so far? Leave `JIRA_TARGET_KEY` blank and it'll skip
+the target checks.
 
-It authenticates, checks each project, lists the boards on each (so you can grab
-the **target board ID** for `build`), validates that the key field is a text
-field, resolves the Sprint custom field id (e.g. `customfield_10020`), and prints
-the key field's **id and resolved JQL name** so you can confirm `.env` is right.
+It authenticates, verifies each project, lists the boards on both (so you can grab
+that **target board ID** for `build`), confirms the key field is actually a text
+field, resolves the Sprint custom field id, and prints the key field's **id and
+resolved JQL name** together. That last bit is your chance to catch a `.env`
+mistake before it costs you. Anything wrong gets logged with the likely cause —
+see [§10](#10-troubleshooting--the-stuff-that-actually-goes-wrong).
 
-If anything fails, the script logs a structured error with the likely cause. See [§8 Troubleshooting](#8-troubleshooting).
+### 7.1 `extract` — snapshot the source
 
----
-
-### 5.1. Run `extract`
-
-**Purpose:** Pull everything you need to (a) understand the source, (b) rebuild structural objects in the target, (c) decide field mappings, and (d) reconcile after bulk-move.
+**Why:** This is your "before" photo. You'll use it to rebuild the target's
+structure, to author your field mappings, and — crucially — to prove at the end
+that the counts line up. Don't skip it or shortcut it; everything downstream leans
+on this baseline.
 
 ```bash
 python3 tmp_to_cmp.py extract
-# Source project comes from JIRA_SOURCE_KEY in .env (override: --source-key TMP).
-# ./out is the default output dir. To override, put --output-dir BEFORE the
-# subcommand (it's a global option): python3 tmp_to_cmp.py --output-dir ./out extract
+# Source from JIRA_SOURCE_KEY (override: --source-key TMP).
+# Heads up: --output-dir is a GLOBAL option, so it goes BEFORE the subcommand:
+#   python3 tmp_to_cmp.py --output-dir ./out extract
 ```
 
-**What it does, in order:**
+What it pulls, in order:
 
-1. Pulls project metadata (name, lead, style).
-2. Single pass over every issue, collecting distinct issue types, distinct (issue type, status) pairs, and counts by type, status, and resolution.
-3. Pulls all versions, components, the board, all sprints (closed + active + future), board config, and project roles.
-4. Runs five JQL approximate-count queries for boolean buckets (with attachments, comments, fixVersion, components, sprint) into the baseline.
-5. Builds a **full field catalog**: every project-scoped field, with allowed values pulled from `/rest/api/3/issue/{key}/editmeta` on a sample issue per type.
-6. Writes everything to `./out/extract/` as JSON (and CSV for the field catalog).
+1. Project metadata — name, lead, style.
+2. A single pass over every issue: distinct issue types, distinct (type, status)
+   pairs, and counts by type, status, and resolution.
+3. All versions, components, the board, every sprint (closed + active + future),
+   the board config, and project roles.
+4. Five "how many issues have X" counts — attachments, comments, fix version,
+   components, sprint. These five are your reconciliation baseline.
+5. A **full field catalog**: every project-scoped field, including the allowed
+   values for select fields, pulled from a sample issue of each type via
+   `/editmeta`.
+6. Writes all of it to `./out/extract/` as JSON, plus a CSV for the field catalog.
 
-The field catalog (`12_source_field_catalog.csv`) is what you use to author the `field_mapping.csv` that `copy-fields` consumes.
+That catalog (`12_source_field_catalog.csv`) is the source of truth you'll use to
+write the `field_mapping.csv` that `copy-fields` consumes later. Keep it handy.
 
-**Inspect the output:** `cat ./out/extract/11_inventory_baseline.json` to see the numbers `validate` reconciles against later. Re-running overwrites the artifacts safely.
+Re-running is safe — it overwrites cleanly. Want to see what `validate` will check
+against? `cat ./out/extract/11_inventory_baseline.json`.
 
----
+### 7.2 `stamp-keys` — give every issue a name tag
 
-### 5.2. Run `stamp-keys`
+**Why:** The second bulk-move runs, every issue gets a brand-new key in the target,
+and the old one is gone. If you ever want to trace `TMP-123` to its new identity —
+for field copies, audit trails, dashboards, anyone asking "where'd my ticket go" —
+you need that old key stored *on the issue* beforehand. So we write each issue's
+current key into a text field while it still has it.
 
-**Purpose:** Bulk-move generates new issue keys in the target project. To survive that, every source issue gets its current key written into a text custom field. After the move you can join old-key → new-key by that field for field copies, audit trails, dashboards.
-
-**Prerequisite check:** the key field must be on the edit screen of every source TMP issue type (see [§2.3](#23-source-project-setup-one-time-in-the-ui)).
-
-Start with dry-run:
+**Prerequisite:** the key field has to be on every source issue type's edit screen
+(see [§4.3](#43-one-time-source-setup-in-the-ui)). This is the step that catches
+people.
 
 ```bash
-python3 tmp_to_cmp.py stamp-keys --dry-run
+python3 tmp_to_cmp.py stamp-keys --dry-run   # look first
+python3 tmp_to_cmp.py stamp-keys             # then commit
+# Source key + field from .env (JIRA_SOURCE_KEY, JIRA_KEY_FIELD).
 ```
 
-Then for real:
+What it does:
+
+1. Confirms the field exists and is text-typed (`string`/`any`).
+2. Test-stamps the oldest issue and reads it back — **bails with a clear error if
+   the value didn't persist.** This is the readback I mentioned; trust it.
+3. Asks you to confirm before it touches the rest.
+4. Walks every issue, writing its key, pausing 100 ms between writes to be polite
+   to the API.
+5. Logs each stamped key to `./out/stamp/stamped.txt` as it goes.
+
+**Got interrupted? Just re-run it.** It reads the checkpoint and skips what's done.
+Failures land in `./out/stamp/failures.csv` with the reason — investigate, fix,
+re-run, and only the un-checkpointed keys retry.
+
+> **One I learned the hard way:** `notifyUsers=false` mutes the field-update email,
+> but it does *not* stop source **automation rules** listening on "Issue Updated."
+> Stamp a few thousand issues with an active automation rule and you've just fired
+> a few thousand webhooks (or worse, reassigned everything). **Disable source
+> automation before you run this.**
+
+### 7.3 `build` — stand up the target's structure
+
+This phase is **manual UI work first, then the script.** Don't skip the manual
+part — it's where the real design decisions live.
+
+#### 7.3.1 Create the target project in the UI
+
+Yes, the script *can* create it (see 7.3.3), but I almost always do this by hand.
+Creating it in the browser gives you the scheme-assignment dialogs, and you nearly
+always want to attach existing standard schemes rather than whatever the API picks.
+
+1. **Create project** → Company-managed → Software (Scrum or Kanban, your call).
+2. **Project key:** use a temporary one like `NEW`. You'll rename it to the real
+   `TMP` key after the move, once the source is renamed to `TMP_OLD`.
+3. **Project settings → Schemes:** assign workflow, screen, field configuration,
+   permission, and notification schemes. Pro move for the cutover window: a
+   dedicated, silent "Migration" notification scheme so you don't spam everyone.
+4. Add `customfield_25199` and any other custom fields you plan to map, onto the
+   right field configurations and screens.
+5. Create a Scrum **board** and note its board ID ([§4.4](#44-the-ids-youll-need-to-dig-up)).
+
+#### 7.3.2 Run the build
+
+Set `JIRA_TARGET_KEY` and `JIRA_TARGET_BOARD_ID` in `.env`, then:
 
 ```bash
-python3 tmp_to_cmp.py stamp-keys
-# Source key + key field come from .env (JIRA_SOURCE_KEY, JIRA_KEY_FIELD).
+python3 tmp_to_cmp.py build --dry-run        # preview
+python3 tmp_to_cmp.py build                  # for real
 ```
 
-**What it does:**
+What it does, in order:
 
-1. Verifies the field exists and has a text (`string`/`any`) schema type.
-2. Test-stamps the oldest issue and reads it back. **Aborts with a clear error if the value didn't persist.**
-3. Asks you to confirm before running on the rest.
-4. Walks every issue with paginated JQL, writing the key via `PUT /rest/api/3/issue/{KEY}?notifyUsers=false`.
-5. Appends each successfully stamped key to `./out/stamp/stamped.txt` as it goes, sleeping 100 ms between writes.
+1. Confirms the target exists and is reachable.
+2. Reads your `extract` artifacts.
+3. **Versions** — reuses any with a matching name, otherwise creates them (dates
+   included), then patches released/archived state. Writes `version_id_mapping.csv`.
+4. **Components** — same reuse-or-create-by-name pattern. Writes
+   `component_id_mapping.csv`.
+5. **Sprints** — needs the board id. Recreates each source sprint with matching
+   name, dates, and goal, then transitions it to the same state. Writes
+   `sprint_id_mapping.csv`.
 
-**Interrupt and resume:** Ctrl-C is safe. Re-run the same command; it reads the checkpoint and skips already-stamped keys.
+**Those three mapping CSVs aren't just logs — they're inputs.** The bulk-move
+wizard's Fix Version / Component / Sprint mapping screens want them, and so do
+`update-sprints` and `report` later. Don't lose them.
 
-**Failures:** any keys that fail land in `./out/stamp/failures.csv` with the error. Investigate and re-run; only un-checkpointed keys retry.
+> **The closed-sprint date thing, up front:** the Agile API stamps a sprint's
+> `completeDate` to the moment *you* close it. There's no backdating. So any closed
+> sprint this step recreates shows the recreation time, not the original
+> completion. The reports flag affected sprints, but if anyone leans on historical
+> Velocity, warn them now. This is a Jira limitation, not a bug in the tool.
 
-**Notification noise:** `notifyUsers=false` suppresses email for the field update itself, but source TMP **automation rules** listening on "Issue Updated" can still fire. **Disable source automation before running.**
+Re-running is safe — existing versions/components/sprints (matched by name) get
+detected and skipped.
 
----
+#### 7.3.3 (Optional) Let the script create the target
 
-### 5.3. Build the target shell + run `build`
-
-This step has **manual UI work first**, then the script.
-
-#### 5.3.1 Manual: create the target CMP in the UI
-
-Project creation via API gives no real control over scheme assignment, and you almost always want to assign existing standard schemes. Doing it in the UI gives you the scheme dialogs.
-
-1. **Create project** → Company-managed → Software (Scrum/Kanban as appropriate).
-2. **Project key**: pick a temporary key like `NEW`. You'll rename it to the original `TMP` key after bulk-move, once the source has been renamed (e.g. to `TMP_OLD`).
-3. **Project settings → Schemes** — assign workflow, screen, field configuration, permission, and notification schemes (a dedicated empty "Silent Migration" notification scheme is recommended for the cutover window).
-4. Add `customfield_25199` and any other global custom fields you'll map to the appropriate field configurations and screens.
-5. Create a Scrum **board** on the target. Note its board ID (see §2.4).
-
-#### 5.3.2 Run the build script
-
-Set `JIRA_TARGET_KEY` and `JIRA_TARGET_BOARD_ID` in `.env` first (the board id
-is the one you noted in step 5 above), then:
-
-```bash
-python3 tmp_to_cmp.py build --dry-run
-```
-
-After the dry-run looks clean, drop `--dry-run`:
-
-```bash
-python3 tmp_to_cmp.py build
-# Target key + board id come from .env (JIRA_TARGET_KEY, JIRA_TARGET_BOARD_ID).
-```
-
-**What it does, in order:**
-
-1. Confirms the target project exists and is accessible.
-2. Reads the source extract artifacts.
-3. **Versions** — dedup by name; otherwise create via `POST /rest/api/3/version` with dates, then patch `released`/`archived`. Writes `version_id_mapping.csv`.
-4. **Components** — same dedup-by-name pattern via `POST /rest/api/3/component`. Writes `component_id_mapping.csv`.
-5. **Sprints** — needs `JIRA_TARGET_BOARD_ID` (or `--target-board-id`). Creates each source sprint on the target board with matching name, dates, and goal, then transitions it through `active` (and `closed`) to match the source state. Writes `sprint_id_mapping.csv`.
-
-**The three mapping CSVs are inputs** to the bulk-move wizard (Fix Version / Component / Sprint mapping screens) and to the later `update-sprints` / `report` phases.
-
-**Sprint closed-date caveat:** the Agile API sets `completeDate` to the moment you close a sprint via script — it cannot be backdated. Closed sprints recreated here show the recreation time.
-
-**Re-running** is safe: existing versions/components/sprints (by name) are detected and skipped.
-
-#### 5.3.3 (Optional) Have the script create the target project
-
-If you can't create the target in the UI, the script can — but you'll still re-assign schemes manually afterward:
+Can't create the project in the UI for some reason? The script will, though you'll
+still re-assign schemes by hand afterward:
 
 ```bash
 python3 tmp_to_cmp.py build \
     --create-target \
     --target-lead 5b10a2844c20165700ede21g
-# --target-key, --target-board-id, --target-template all default from .env;
-# --create-target and --target-lead are the extra inputs for project creation.
+# --target-key, --target-board-id, --target-template default from .env.
 ```
 
-`--target-lead` takes the lead user's accountId (see §2.4), or set
-`JIRA_TARGET_LEAD` in `.env`. `--target-template` defaults to
-`JIRA_TARGET_TEMPLATE` (Scrum classic CMP).
+`--target-lead` wants the lead's account id ([§4.4](#44-the-ids-youll-need-to-dig-up)),
+or set `JIRA_TARGET_LEAD`. `--target-template` defaults to Scrum classic CMP.
 
----
+### 7.4 The bulk-move (you, in the Jira UI)
 
-### 5.4. Bulk-move in the UI
+**Not a script step — this is all you, in the browser, during the cutover window.**
 
-This is **not** a script step. During the cutover window:
+1. In the source TMP, select all issues and run Jira's native **bulk-move** into
+   the target CMP.
+2. On the wizard's mapping screens, feed it the `version_id_mapping.csv`,
+   `component_id_mapping.csv`, and `sprint_id_mapping.csv` from `build`. This is
+   what keeps fix versions, components, and sprints pointing at the right targets.
+3. Optionally rename: source → `TMP_OLD`, target → `TMP`, so the new project
+   inherits the original key and nobody's bookmarks break.
 
-1. In the source TMP, select all issues and use Jira's native **bulk-move** to move them into the target CMP.
-2. On the wizard's mapping screens, use the `version_id_mapping.csv`, `component_id_mapping.csv`, and `sprint_id_mapping.csv` from `build` to map fields correctly.
-3. After the move, rename the projects: source → `TMP_OLD`, target → `TMP` (so the target inherits the original key).
+> **If you renamed, update `.env` right now** — set `JIRA_SOURCE_KEY=TMP_OLD` and
+> `JIRA_TARGET_KEY=TMP` before you run anything below, or pass `--source-key` /
+> `--target-key` per command. Skip this if you kept stable keys.
 
-> **Update `.env` after the rename.** If you renamed in step 3, set
-> `JIRA_SOURCE_KEY=TMP_OLD` and `JIRA_TARGET_KEY=TMP` in `.env` now, so every
-> post-move command below points at the renamed projects. (Skip this if you
-> didn't rename.) Alternatively pass `--source-key` / `--target-key` per command.
+Bulk-move brings history, comments, attachments, and worklogs across cleanly. What
+it does *not* preserve in any usable form: TMP-scoped custom field values and the
+original sprint membership. Repairing those two is exactly what `update-sprints`
+and `copy-fields` are for.
 
-The bulk-move carries issue history, comments, attachments, and worklogs. It does **not** preserve TMP-scoped custom field values or the original sprint membership in a usable form — that's what `update-sprints` and `copy-fields` repair next.
+### 7.5 `update-sprints` — put issues back on their sprints
 
----
-
-### 5.5. Run `update-sprints`
-
-**Purpose:** After bulk-move, target issues may still reference the *source* sprint IDs (or lose sprint membership). This command rewrites the Sprint field on every target issue from source sprint IDs to the corresponding target sprint IDs, using `build/sprint_id_mapping.csv`.
+**Why:** After the move, target issues often still reference the *source* sprint
+ids, or lose sprint membership entirely. This rewrites each issue's Sprint field
+from the old sprint id to the matching target one, using `build/sprint_id_mapping.csv`.
 
 ```bash
 python3 tmp_to_cmp.py update-sprints --dry-run
 python3 tmp_to_cmp.py update-sprints
-# Target key comes from .env (JIRA_TARGET_KEY).
+# Target key from .env (JIRA_TARGET_KEY).
 ```
 
-**Execution model:**
+How it works under the hood:
 
-1. **Plan** — scan the target once (migrated issues only — see scope note), grouping issues by whether their target sprint set includes any *closed* sprints.
-2. **Phase A** — issues whose target sprints are all non-closed are updated directly.
-3. **Phase B** — for each closed target sprint with pending issues: reopen → update its issues → re-close. Only one closed sprint is reopened at a time (Jira disallows more than one active sprint unless parallel sprints are enabled on the board).
+1. **Plan** — one scan of the target (migrated issues only), grouping issues by
+   whether their target sprints include any *closed* ones.
+2. **Phase A** — issues whose sprints are all open get updated directly. Easy.
+3. **Phase B** — for each closed sprint with pending issues: reopen it → update its
+   issues → close it again. Only one closed sprint is reopened at a time, because
+   Jira won't allow two active sprints on a board unless parallel sprints are on.
 
-> **Scope: migrated issues only.** The plan scan is filtered to issues whose key
-> field **IS NOT EMPTY** (by JQL **name** — see §2.5), so a reused target
-> project's pre-existing issues are never rewritten. If no key field name
-> resolves, it falls back to scanning all issues and logs a warning.
+The caveats, and I want to be straight with you because this is the fiddliest part
+of the whole toolkit:
 
-**Caveats** (logged and written to CSV):
-- Re-closing a sprint stamps a new `completeDate` of *now*; the original is unrecoverable.
-- Issues spanning **more than one** closed sprint are skipped and listed in `multi_closed_issues.csv` for manual handling.
-- Issues referencing a source sprint with no target mapping are listed in `missing_sprint_map.csv`.
+- Re-closing a sprint stamps a fresh `completeDate` of *now*. The original is gone.
+- Issues that belong to **more than one** closed sprint get skipped and listed in
+  `multi_closed_issues.csv` for manual handling.
+- Issues whose source sprint has no mapping land in `missing_sprint_map.csv`.
 
-**Resume:** checkpointed in `./out/update_sprints/updated.txt`. Per-sprint cycle outcomes go to `sprint_cycle_log.csv`; failures to `failures.csv`.
+Resumable via `./out/update_sprints/updated.txt`. Per-sprint outcomes go to
+`sprint_cycle_log.csv`, failures to `failures.csv`.
 
-> **If closed sprints get in your way:** the reopen/re-close cycle this command
-> performs is fragile — it fails when the board disallows more than one active
-> sprint, and it skips issues that belong to multiple closed sprints. When that
-> happens, skip the API approach entirely and use
-> [`export-sprint-csv`](#55b-run-export-sprint-csv-closed-sprint-fallback) (§5.5b)
-> instead: it sets sprint membership by id through Jira's External Import, which
-> has no such restriction on closed sprints.
+> **Real talk:** this reopen/re-close dance is the fragile part. It falls over when
+> the board forbids multiple active sprints, and it punts on multi-closed issues.
+> If closed sprints are giving you grief — and on a mature project they will —
+> don't fight it. Skip straight to
+> [`export-sprint-csv`](#75b-export-sprint-csv--the-move-that-always-works) below.
+> It sets sprint membership by id through Jira's import, with none of these
+> restrictions. On bigger migrations I often just go straight to the CSV route.
 
----
+### 7.5b `export-sprint-csv` — the move that always works
 
-### 5.5b. Run `export-sprint-csv` (closed-sprint fallback)
+**Why:** `update-sprints` can only attach an issue to a closed sprint by
+temporarily reopening it, and that approach breaks on boards that forbid multiple
+active sprints or when an issue spans several closed sprints. Jira's built-in
+**External System Import** sets the Sprint field directly by **sprint id** — no
+reopening, no re-closing, no restrictions. It's the dependable way to restore
+historical sprint membership, full stop. This command just builds the CSV that the
+import consumes; it **makes zero changes to Jira**. The import itself is a manual
+UI step.
 
-**Purpose:** `update-sprints` rewrites the Sprint field through the REST API,
-which can only attach an issue to a *closed* sprint by temporarily reopening it.
-That breaks down when a board forbids more than one active sprint, or when an
-issue spans several closed sprints. Jira's built-in **External System Import**
-sets the Sprint field by **sprint id** with no reopen/re-close dance, so it is
-the reliable way to re-attach historical sprint membership. This command
-produces the CSV that import consumes — it makes **no writes** to Jira; the
-import itself is a manual UI step.
-
-It reads the same `build/sprint_id_mapping.csv` as `update-sprints`, scans the
-target project for every **migrated** issue that still carries a sprint, maps the
-source sprint ids to the target sprint ids, and writes one row per issue. Like
-`validate`/`report`, the scan is scoped to migrated issues only (key field name
-`IS NOT EMPTY`; see §2.5), so a reused target project's pre-existing issues are
-left out of both the CSV and the unmapped list.
+It reads the same `build/sprint_id_mapping.csv`, scans the target for every
+migrated issue still carrying a sprint, maps source sprint ids to target, and
+writes one row per issue.
 
 ```bash
 python3 tmp_to_cmp.py export-sprint-csv
-# Target key comes from .env (JIRA_TARGET_KEY).
+# Target key from .env (JIRA_TARGET_KEY).
 ```
 
-**Output:** `./out/export_sprint_csv/sprint_import.csv`, a **semicolon-delimited**
-(`;`) CSV with these columns:
+**Output:** `./out/export_sprint_csv/sprint_import.csv` — **semicolon-delimited**,
+with these columns:
 
 | Column | Notes |
 |---|---|
-| `Issue Key` | The live target issue key (used by import to match the issue). |
-| `Assignee` | The assignee's email address (falls back to account id, then display name; blank if unassigned). |
-| `Summary` | Issue summary (for human readability during the import field-mapping step). |
+| `Issue Key` | The live target issue key; import matches issues by this. |
+| `Assignee` | Assignee email (falls back to account id, then display name; blank if unassigned). |
+| `Summary` | For human readability during the import's field-mapping step. |
 | `Project name` | Target project name. |
 | `Project Key` | Target project key. |
 | `Project Type` | Target project type key (e.g. `software`). |
-| `Sprint ID` | The **target** sprint id(s). An issue in more than one sprint gets all its ids **comma-separated** in this single cell. |
+| `Sprint ID` | The **target** sprint id(s). An issue in several sprints gets them all in one cell, **comma-separated**. |
 
-The delimiter is a semicolon **on purpose**: the `Sprint ID` cell uses commas to
-separate multiple ids, so a comma can't also be the field separator. Fields that
-themselves contain a semicolon (e.g. a summary) are double-quoted per standard
-CSV rules, so the file round-trips cleanly.
+> **Why semicolons and not commas?** Because the `Sprint ID` cell already uses
+> commas to separate multiple sprint ids, so a comma can't double as the column
+> separator. Anything containing a semicolon gets double-quoted per standard CSV
+> rules, so the file round-trips cleanly. When you set up the import, you'll point
+> Jira at the semicolon delimiter.
 
-Issues whose source sprint has no target mapping are **omitted** from the import
-CSV and listed in `./out/export_sprint_csv/missing_sprint_map.csv` for follow-up
-(rerun `build` if a sprint is missing from the mapping).
+Issues whose source sprint has no target mapping are **left out** of the CSV and
+listed in `missing_sprint_map.csv` (re-run `build` if a sprint's missing from the
+map).
 
-**Importing into Jira:**
+Importing it:
 
 1. Jira → **Settings** → **System** → **External System Import** → **CSV**.
-2. Upload `sprint_import.csv`. On the settings screen set the **delimiter to
-   semicolon (`;`)**.
-3. On the field-mapping screen, map `Issue Key` to **Issue key** (so import
-   updates existing issues rather than creating new ones), `Sprint ID` to
-   **Sprint**, and the remaining columns to their like-named fields.
-4. Run the import and review Jira's import log.
+2. Upload `sprint_import.csv`. On the settings screen, set the **delimiter to
+   semicolon (`;`)** — don't skip this or every row mangles.
+3. On field mapping: `Issue Key` → **Issue key** (so it updates existing issues
+   instead of creating new ones — important!), `Sprint ID` → **Sprint**, and the
+   rest to their like-named fields.
+4. Run it, then read Jira's import log.
 
-This command is read-only and safe to re-run; it overwrites the CSV each time.
+Read-only and safe to re-run; it overwrites the CSV each time.
 
----
+### 7.6 `copy-fields` — bring the field values across
 
-### 5.6. Run `copy-fields`
+**Why:** Bulk-move drops TMP-scoped custom field values. This copies them from each
+source issue to its target counterpart, matching on the stamped key.
 
-**Purpose:** Copy custom-field values that didn't survive the bulk-move from each source issue to its target counterpart, joining on the stamped key.
-
-**Prerequisite:** author a mapping CSV at `./out/mapping/field_mapping.csv` with columns:
+**Prerequisite:** author a mapping CSV at `./out/mapping/field_mapping.csv`:
 
 ```
 source_field_id,target_field_id,transform
@@ -460,116 +615,105 @@ customfield_10050,customfield_22001,copy
 customfield_10051,customfield_22002,append_suffix
 ```
 
-- `transform` is optional per row. Supported values: `copy` (default), `append_prefix` (writes `Original: <value>`), `append_suffix` (writes `<value> (migrated)`).
-- Use the `extract` field catalog (`12_source_field_catalog.csv`) to find source field ids.
+- `transform` is optional per row. Options: `copy` (default), `append_prefix`
+  (writes `Original: <value>`), `append_suffix` (writes `<value> (migrated)`).
+- Use the `extract` field catalog (`12_source_field_catalog.csv`) to find the
+  source field ids — that's what it's there for.
 
 ```bash
 python3 tmp_to_cmp.py copy-fields --dry-run
 python3 tmp_to_cmp.py copy-fields
-# Source/target keys come from .env. After the §5.4 rename these are
-# JIRA_SOURCE_KEY=TMP_OLD and JIRA_TARGET_KEY=TMP.
+# Source/target keys from .env (after the §7.4 rename, that's TMP_OLD / TMP).
 ```
 
-**What it does:** finds every target issue with a stamped source key, fetches the mapped fields from the source issue, applies any transform, and writes them to the target via `PUT`. Checkpointed in `./out/copy_fields/copied.txt`; failures in `failures.csv`.
+It finds every target issue with a stamped source key, pulls the mapped fields off
+the source issue, applies any transform, and writes them to the target. Resumable
+via `./out/copy_fields/copied.txt`; failures in `failures.csv`.
 
----
+### 7.7 `validate` — prove nothing was lost
 
-### 5.7. Run `validate`
-
-After bulk-move (and the re-stitch steps), reconcile against the baseline:
+This is where you earn back the project lead's trust. After the move and the
+reconnect steps, reconcile against the baseline:
 
 ```bash
 python3 tmp_to_cmp.py validate
-# Target key + key field (id and JQL name) come from .env.
+# Target key + key field (id and JQL name) from .env.
 ```
 
-**What it does:**
+What it does:
 
 1. Loads the baseline from `./out/extract/11_inventory_baseline.json`.
-2. Scans the target project with the same logic used in extract — but **scoped to migrated issues only** (see callout below).
-3. Computes per-category diffs and writes `target_inventory.json`, `validation_delta.json`, and `validation_summary.csv`.
-4. If `build/sprint_id_mapping.csv` exists, compares per-sprint issue counts source-vs-target (target side scoped to migrated issues) and writes `sprint_mismatches.json` on any mismatch.
-5. If `mapping/field_mapping.csv` exists, samples up to 50 target issues and compares mapped field values against source, writing `field_mismatches.json` on any mismatch.
+2. Re-scans the target with the same logic as `extract` — but **counting migrated
+   issues only**, so a reused target's pre-existing issues don't pollute the
+   comparison.
+3. Computes per-category diffs and writes `target_inventory.json`,
+   `validation_delta.json`, and `validation_summary.csv`.
+4. If a sprint mapping exists, compares per-sprint counts and writes
+   `sprint_mismatches.json` on any mismatch.
+5. If a field mapping exists, samples up to 50 target issues and compares mapped
+   field values, writing `field_mismatches.json` on any mismatch.
 
-> **Scope: migrated issues only.** Every target-side count is filtered to issues
-> whose key field **IS NOT EMPTY** — i.e. only the issues that came from the
-> source project. The filter is expressed in JQL by the field's **name**
-> (`JIRA_KEY_FIELD_NAME`, e.g. `Original Work Item Key[Short text]`), not its
-> `customfield_x` id (see §2.5). This is essential when the target is an
-> **already-in-use** project being consolidated into: its pre-existing issues are
-> excluded so the comparison against the source baseline stays apples-to-apples.
-> The source-side baseline is unaffected (the whole source project is in scope).
-> If no key field name can be resolved, validation falls back to **all** target
-> issues and logs a warning.
+If the aggregate diffs aren't zero, it logs which buckets are off. Don't declare
+victory on a glance — open `validation_delta.json` and see *by how much*. Small
+expected deltas happen (a status renamed mid-flight, say); surprises don't get to
+slide.
 
-If aggregate diffs are non-zero the script logs which buckets are off; open `validation_delta.json` to see by how much before declaring success.
+### 7.8 `report` — the deliverable for the team
 
----
-
-### 5.8. Run `report`
-
-**Purpose:** Produce a polished, multi-sheet Excel workbook for the project team summarizing the whole migration.
+**Why:** A clean, multi-sheet Excel workbook is what you actually hand to
+stakeholders. It's the artifact that closes out the migration.
 
 ```bash
 python3 tmp_to_cmp.py report
-# Source/target keys + key field come from .env. After the §5.4 rename these are
-# JIRA_SOURCE_KEY=TMP_OLD and JIRA_TARGET_KEY=TMP.
+# Source/target keys + key field from .env (after §7.4 rename, TMP_OLD / TMP).
 ```
 
-Both a source and a target key must be set (via `.env` or `--source-key` /
-`--target-key`) — `report` errors out if either is missing. It reads from
-`extract/`, `build/`, `update_sprints/`, and (optionally) `validate/`, then
-re-queries the target live for current inventory, per-sprint counts, and a full
-key map. The output is `./out/report/migration_report.xlsx` with sheets:
+You need both a source and target key set, or it errors out. It reads from
+`extract/`, `build/`, `update_sprints/`, and (if present) `validate/`, re-queries
+the target live, and writes `./out/report/migration_report.xlsx` with these sheets:
 
-> **Scope: migrated issues only.** As with `validate`, every target-side number
-> in the report (inventory, content buckets, per-sprint counts, issue key map)
-> counts only migrated issues — those whose key field **IS NOT EMPTY**, filtered
-> in JQL by the field **name** (`JIRA_KEY_FIELD_NAME`; see §2.5). A target
-> project already in use before the consolidation reports on what was migrated
-> into it, not its pre-existing issues.
-
-
-- **Summary** — headline KPIs with OK/REVIEW/ATTENTION status, sprint cycle outcomes, and callouts.
-- **Issue Counts** — source vs target by type / status / resolution (live Excel formulas).
+- **Summary** — headline KPIs with OK/REVIEW/ATTENTION status, sprint cycle
+  outcomes, and callouts.
+- **Issue Counts** — source vs. target by type / status / resolution, with live
+  Excel formulas.
 - **Sprints** — per-sprint reconciliation with deltas.
 - **Versions** / **Components** — present/missing checks.
 - **Content Buckets** — attachment/comment/version/component/sprint coverage %.
-- **Issue Key Map** — every migrated issue: source key → clickable target key, type, status, summary.
-- **Exceptions** — unmapped sprints, multi-closed issues, update/copy failures, membership mismatches.
-- **Methodology** — plain-language notes on caveats (including the sprint `completeDate` behavior).
+- **Issue Key Map** — every migrated issue: old key → clickable new key, plus type,
+  status, summary.
+- **Exceptions** — unmapped sprints, multi-closed issues, update/copy failures,
+  membership mismatches.
+- **Methodology** — plain-language notes on the caveats, including that
+  `completeDate` behavior, so nobody's surprised later.
 
-Requires `openpyxl` (installed via `requirements.txt`).
+Every target-side number counts migrated issues only, same as `validate`. Needs
+`openpyxl` (it's in `requirements.txt`).
 
 ---
 
-## 6. Command reference
+## 8. Command reference
 
 ```
 python3 tmp_to_cmp.py [--base-url URL] [--email EMAIL] [--output-dir DIR] [--verbose] <subcommand> [opts]
 
-Global options:
-  --base-url    Jira site URL (or set JIRA_BASE_URL).
-  --email       Account email (or set JIRA_EMAIL).
-  --output-dir  Artifacts directory. Default: ./out (or JIRA_OUTPUT_DIR).
+Global options (these go BEFORE the subcommand):
+  --base-url    Jira site URL (or JIRA_BASE_URL).
+  --email       Account email (or JIRA_EMAIL).
+  --output-dir  Artifacts directory. Default ./out (or JIRA_OUTPUT_DIR).
   --verbose     Debug logging.
 
-All per-command options below also read from `.env` (see §4); the flags shown
-are optional overrides. With a populated `.env`, the commands reduce to e.g.
-`tmp_to_cmp.py validate`, `tmp_to_cmp.py report`, `tmp_to_cmp.py export-sprint-csv`.
+With a populated .env, the flags below are just optional overrides — most runs
+boil down to `tmp_to_cmp.py extract`, `… build`, `… validate`, `… report`.
 
-Subcommands:
-
-  doctor [--source-key X] [--target-key Y] [--key-field customfield_25199] [--key-field-name NAME]
-      Auth + project access check, board listing, sprint-field resolution, and
-      the resolved key-field JQL name. No writes.
+  doctor [--source-key X] [--target-key Y] [--key-field ID] [--key-field-name NAME]
+      Auth + project access check, board listing, sprint-field + key-field name
+      resolution. Never writes.
 
   extract --source-key X
-      Extract source project + full field catalog to ./out/extract/.
+      Snapshot the source project + full field catalog to ./out/extract/.
 
-  stamp-keys --source-key X [--key-field customfield_25199] [--dry-run]
-      Write each source issue's key into the text custom field.
-      Idempotent via ./out/stamp/stamped.txt.
+  stamp-keys --source-key X [--key-field ID] [--dry-run]
+      Write each source issue's key into the text custom field. Resumable.
 
   build --target-key Y [--target-board-id N]
         [--create-target --target-lead ACCOUNT_ID]
@@ -577,33 +721,27 @@ Subcommands:
       Recreate versions, components, sprints in target. Writes mapping CSVs.
 
   update-sprints --target-key Y [--dry-run]
-      Rewrite the Sprint field on target issues from source to target sprint IDs,
-      reopening/re-closing closed sprints as needed. Needs build/sprint_id_mapping.csv.
+      Rewrite the Sprint field from source to target sprint IDs.
+      Needs build/sprint_id_mapping.csv.
 
   export-sprint-csv --target-key Y
-      Emit a semicolon-delimited CSV (./out/export_sprint_csv/sprint_import.csv)
-      mapping each target issue to its new sprint id(s), for Jira's External
-      System Import. Read-only fallback for closed sprints. Needs
-      build/sprint_id_mapping.csv.
+      Emit a semicolon-delimited CSV for Jira's External System Import — the
+      reliable closed-sprint fallback. Read-only. Needs build/sprint_id_mapping.csv.
 
-  copy-fields --source-key X --target-key Y [--key-field customfield_25199] [--key-field-name NAME] [--dry-run]
-      Copy mapped field values from source to target, joining on the stamped key.
+  copy-fields --source-key X --target-key Y [--key-field ID] [--key-field-name NAME] [--dry-run]
+      Copy mapped field values, matching on the stamped key.
       Needs ./out/mapping/field_mapping.csv.
 
-  validate --target-key Y [--key-field customfield_25199] [--key-field-name NAME]
-      Compare baseline (from extract) against current target, scoped to migrated
-      issues only; optional sprint and field-value checks.
+  validate --target-key Y [--key-field ID] [--key-field-name NAME]
+      Compare the baseline against the current target (migrated issues only).
 
-  report --source-key X --target-key Y [--key-field customfield_25199] [--key-field-name NAME]
-      Generate ./out/report/migration_report.xlsx for the project team (target
-      figures scoped to migrated issues only).
+  report --source-key X --target-key Y [--key-field ID] [--key-field-name NAME]
+      Generate ./out/report/migration_report.xlsx (target figures = migrated only).
 ```
 
 ---
 
-## 7. Output artifacts
-
-After running all phases, `./out/` contains:
+## 9. Everything the tool writes to `out/`
 
 ```
 out/
@@ -620,9 +758,9 @@ out/
 │   ├── 09_roles.json
 │   ├── 11_inventory_baseline.json
 │   ├── 12_source_field_catalog.json
-│   └── 12_source_field_catalog.csv        # Use this to author field_mapping.csv
+│   └── 12_source_field_catalog.csv        # Author field_mapping.csv from this
 ├── stamp/
-│   ├── stamped.txt                        # Checkpoint: one issue key per line
+│   ├── stamped.txt                        # Checkpoint: one key per line
 │   └── failures.csv                       # If any
 ├── build/
 │   ├── version_id_mapping.csv
@@ -634,11 +772,11 @@ out/
 │   ├── updated.txt                        # Checkpoint
 │   ├── missing_sprint_map.csv             # If any
 │   ├── multi_closed_issues.csv            # If any (manual follow-up)
-│   ├── sprint_cycle_log.csv               # Reopen/close outcomes per closed sprint
+│   ├── sprint_cycle_log.csv               # Reopen/close outcomes per sprint
 │   └── failures.csv                       # If any
 ├── export_sprint_csv/
-│   ├── sprint_import.csv                  # Semicolon-delimited; for Jira External Import
-│   └── missing_sprint_map.csv            # If any (issues with no target sprint mapping)
+│   ├── sprint_import.csv                  # Semicolon-delimited; for External Import
+│   └── missing_sprint_map.csv             # If any
 ├── copy_fields/
 │   ├── copied.txt                         # Checkpoint
 │   └── failures.csv                       # If any
@@ -654,69 +792,111 @@ out/
 
 ---
 
-## 8. Troubleshooting
+## 10. Troubleshooting — the stuff that actually goes wrong
 
 ### `Authentication failed` (401)
 
-1. **Token validity.** Tokens expire. Generate a fresh one at https://id.atlassian.com/manage-profile/security/api-tokens.
-2. **Email matches token owner.** `JIRA_EMAIL` must be the exact email of the account that created the token.
-3. **Base URL / site access.** The account must have access to the specific `JIRA_BASE_URL` site. For a sandbox, ensure your account is provisioned there.
+1. **Token expired.** They do. Mint a fresh one at the [token page](https://id.atlassian.com/manage-profile/security/api-tokens).
+2. **Email doesn't match the token owner.** `JIRA_EMAIL` has to be the exact email
+   of the account that created the token.
+3. **Wrong site / no access.** The account must have access to that specific
+   `JIRA_BASE_URL`. Sandbox? Make sure you're provisioned there.
 
 ### Source/target project not accessible
 
-- **Key case mismatch** → use the exact key the API reports (keys are case-sensitive).
-- **Project exists but no BROWSE permission** → the token owner can't see it; add them to a project role or use a different token.
-- **Wrong site** → browse to the project in the UI and confirm the key and site match `JIRA_BASE_URL`.
+- **Key case mismatch** → use the exact key the API reports. Keys are case-sensitive.
+- **No Browse permission** → the token owner can't see the project. Add them to a
+  role or use a different token.
+- **Wrong site** → open the project in the browser and confirm the key and site
+  match `JIRA_BASE_URL`.
 
 ### `Test stamp failed: field not editable on issue type.`
 
-The key field is not on the edit screen for that issue type in the source TMP. Add it to the layout for **every** issue type (see §2.3), save, and re-run.
+The key field isn't on that issue type's edit screen in the source. Add it to
+**every** issue type's layout ([§4.3](#43-one-time-source-setup-in-the-ui)), save,
+re-run. This is the most common `stamp-keys` snag, every time.
 
 ### `Key field customfield_X must be a text field (type string/any).`
 
-You picked a non-text field. The stamping target must be a single-line text field. Create one if needed and re-run with the correct `--key-field`.
+You pointed it at a non-text field. The stamp target has to be a single-line text
+field — create one if needed and re-run with the right `--key-field`.
 
 ### `Could not resolve Sprint custom field id`
 
-The Sprint field is resolved at runtime from `/rest/api/3/field` by its schema key. This error means Jira Software (Agile) isn't enabled on the instance, or the token can't see agile fields. `update-sprints` and sprint-related steps need it.
+Jira Software (Agile) isn't enabled on the instance, or the token can't see agile
+fields. Every sprint-related step needs this resolved.
 
 ### `429 Too Many Requests`
 
-The client already retries with exponential backoff. If sustained, increase `SLEEP_BETWEEN_WRITES` at the top of `tmp_to_cmp.py`.
+The client already retries with exponential backoff, so a stray 429 is fine. If
+it's *sustained*, bump `SLEEP_BETWEEN_WRITES` near the top of `tmp_to_cmp.py`.
 
 ### `POST /rest/api/3/search/jql -> 400`
 
-The new search endpoint validates strictly: it returns **no field data unless `fields` is set in the body**, rejects `startAt` (pagination is `nextPageToken`-based), and rejects a `null` first-page token. The toolkit handles all of these; the error log includes the full request body so you can see exactly what was sent.
+Jira's newer search endpoint is strict: no field data unless `fields` is in the
+body, no `startAt` (pagination is token-based), and no null first-page token. The
+tool handles all three — and the error log includes the full request body so you
+can see exactly what went out.
 
 ### `Field 'customfield_25199' does not exist` (JQL 400)
 
-JQL matches custom fields by **name**, not by the `customfield_x` id. `validate`,
-`report`, and `copy-fields` filter on the key field, so they need its name. Set
-`JIRA_KEY_FIELD_NAME` to the exact field-picker name (including any `[Short text]`
-suffix), e.g. `Original Work Item Key[Short text]` — see §2.5. Run `doctor` to
-confirm the id and resolved JQL name. If the auto-resolved name is ambiguous or
-wrong, set `JIRA_KEY_FIELD_NAME` explicitly.
+This is the two-names gotcha biting. JQL matches custom fields by **name**, not by
+the `customfield_x` id. `validate`, `report`, and `copy-fields` filter on the key
+field, so they need its name. Set `JIRA_KEY_FIELD_NAME` to the exact field-picker
+name (including any `[Short text]` suffix), e.g. `Original Work Item Key[Short text]`.
+Run `doctor` to confirm the id and resolved name line up.
 
 ### Sprint reopen fails with an active-sprint conflict
 
-A board can have only one active sprint unless **parallel sprints** are enabled. `update-sprints` reopens one closed sprint at a time, but if another sprint is already active the reopen fails — enable parallel sprints on the target board and re-run.
+A board allows one active sprint unless **parallel sprints** are enabled.
+`update-sprints` reopens one closed sprint at a time, but if another's already
+active, the reopen fails. Enable parallel sprints and re-run — or, honestly, just
+use [`export-sprint-csv`](#75b-export-sprint-csv--the-move-that-always-works) and
+sidestep the whole thing.
 
 ### `Baseline not found. Run 'extract' first.` / `Sprint mapping not found. Run 'build' first.`
 
-`validate`/`report` read `extract/11_inventory_baseline.json`; `update-sprints` reads `build/sprint_id_mapping.csv`. If you used a non-default `--output-dir`, point every command at the same one (it's a global option, before the subcommand).
+`validate`/`report` read `extract/11_inventory_baseline.json`; `update-sprints`
+reads `build/sprint_id_mapping.csv`. If you used a custom `--output-dir`, point
+*every* command at the same one — it's a global option, so it goes before the
+subcommand.
 
 ---
 
-## 9. Known limitations
+## 11. Known limitations — read before you promise anything
 
-1. **Sprint `completeDate` cannot be backdated.** The Agile API stamps it at the moment of close. Closed sprints created by `build`, and closed sprints re-closed by `update-sprints`, show the run time rather than the original close time. The reports flag affected sprints; historical Velocity may need recomputing.
+These aren't bugs to fix later; they're constraints of Jira itself. Set
+expectations with your stakeholders accordingly.
 
-2. **TMP-scoped custom field IDs are not portable.** `extract` catalogs every project-scoped field so you can author `field_mapping.csv`; `copy-fields` does the actual re-stitching, joining on the stamped key.
+1. **Sprint `completeDate` can't be backdated.** The Agile API stamps it at the
+   moment of close. Closed sprints created by `build`, and ones re-closed by
+   `update-sprints`, show the run time, not the original. The reports flag the
+   affected sprints; if anyone relies on historical Velocity, it may need
+   recomputing.
 
-3. **Board configuration is exported to JSON for reference only.** Columns, swimlanes, quick filters, card layout — all manual rebuild. Usually a good chance to clean these up rather than copy blindly.
+2. **TMP-scoped custom field ids aren't portable.** That's why `extract` catalogs
+   every field and `copy-fields` does the re-stitching by matching on the stamped
+   key. There's no shortcut around the mapping CSV.
 
-4. **Issues spanning multiple closed sprints are skipped by `update-sprints`** unless parallel sprints are enabled on the target board. They're listed in `multi_closed_issues.csv`. The robust workaround is `export-sprint-csv` (§5.5b): it sets sprint membership by id via Jira's External System Import, which has no reopen/active-sprint restriction, so closed and multi-closed sprints import cleanly.
+3. **Board configuration is exported for reference only.** Columns, swimlanes,
+   quick filters, card layout — all manual rebuild on the target. I usually treat
+   this as a chance to clean them up rather than copy old cruft blindly.
 
-5. **`stamp-keys` notification suppression** covers the field update itself only. Source automation rules listening on "Issue Updated" can still fire — **disable source TMP automation before running.**
+4. **Issues spanning multiple closed sprints are skipped by `update-sprints`**
+   unless parallel sprints are enabled. They're listed in `multi_closed_issues.csv`.
+   The robust answer is
+   [`export-sprint-csv`](#75b-export-sprint-csv--the-move-that-always-works) —
+   the External System Import has no reopen/active-sprint restriction, so closed
+   and multi-closed sprints import cleanly.
 
-6. **Schemes, workflows, screens, and global custom fields are out of scope.** Create the target shell and assign schemes in the UI (§5.3.1); the toolkit only rebuilds versions, components, and sprints.
+5. **`stamp-keys` notification suppression covers the field update only.** Source
+   automation rules on "Issue Updated" can still fire — **disable source automation
+   before running.** I've said it twice now because it's the one that surprises
+   people.
+
+6. **Schemes, workflows, screens, and global custom fields are out of scope.** You
+   build the target shell and assign schemes in the UI
+   ([§7.3.1](#731-create-the-target-project-in-the-ui)); the toolkit handles
+   versions, components, and sprints. The design decisions stay with you, where
+   they belong.
+```
